@@ -1,0 +1,27 @@
+plugins {
+    id 'java-library'
+}
+
+group 'xyz.sodiumdev'
+version '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(17))
+    }
+}
+
+dependencies {
+    implementation 'org.jetbrains:annotations:23.0.0'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.8.1'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.8.1'
+    implementation 'org.ow2.asm:asm-commons:9.4'
+}
+
+test {
+    useJUnitPlatform()
+}
