@@ -21,6 +21,8 @@ public enum TokenType {
     TOKEN_PRINT, TOKEN_RETURN, TOKEN_SUPER, TOKEN_THIS,
     TOKEN_TRUE, TOKEN_LET, TOKEN_WHILE,
 
+    IMPORT,
+
     TOKEN_ERROR, TOKEN_EOF;
 
     public InvalidTokenException makeInvalidTokenException(Compiler compiler, String text) {

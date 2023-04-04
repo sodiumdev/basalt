@@ -18,6 +18,8 @@ public class Compiler {
     public final Parser parser;
     public final Scanner scanner;
 
+    private static final Set<BuiltInModuleRegistry.BuiltInModule> importedModules = new HashSet<>();
+
     public static Map<String, ClassNode> classes = new HashMap<>();
 
     public String currentClass;
@@ -53,6 +55,7 @@ public class Compiler {
         rules.put(TokenType.TOKEN_EOF, ParseRule.NULL);
         rules.put(TokenType.TOKEN_RETURN, ParseRule.NULL);
         rules.put(TokenType.TOKEN_CLASS, ParseRule.NULL);
+        rules.put(TokenType.TOKEN_WHILE, ParseRule.NULL);
 
         rules.put(TokenType.TOKEN_LEFT_PAREN, new ParseRule(Compiler::grouping, Compiler::call, Precedence.PREC_CALL));
         rules.put(TokenType.TOKEN_DOT, new ParseRule(null, Compiler::dot, Precedence.PREC_CALL));
@@ -79,6 +82,8 @@ public class Compiler {
         rules.put(TokenType.TOKEN_FALSE, new ParseRule(Compiler::literal, null, Precedence.PREC_NONE));
         rules.put(TokenType.TOKEN_TRUE, new ParseRule(Compiler::literal, null, Precedence.PREC_NONE));
         rules.put(TokenType.TOKEN_NIL, new ParseRule(Compiler::literal, null, Precedence.PREC_NONE));
+
+        rules.put(TokenType.IMPORT, new ParseRule(Compiler::import_, null, Precedence.PREC_NONE));
     }
 
     private enum CompilerType {
@@ -98,13 +103,13 @@ public class Compiler {
         mainClass.name = "xyz/sodiumdev/asm/Generated";
         mainClass.superName = "java/lang/Object";
 
-        MethodNode mainMethod = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, null, null, null, null);
-
-        mainClass.methods.add(mainMethod);
+        MethodNode mainMethod = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "main", "([Ljava/lang/String;)V", null, null);
 
         currentClass = "Generated";
         currentMethod = 0;
         classes.put(currentClass, mainClass);
+
+        addMethodToCurrentClass(mainMethod);
     }
 
     @SuppressWarnings("CopyConstructorMissesField")
@@ -148,28 +153,17 @@ public class Compiler {
     public MethodNode getCurrentMethod(boolean create) {
         ClassNode classNode = getCurrentClass();
 
-        try {
-            if (classNode == null)
-                return create ? generateMethod() : null;
+        if (classNode == null)
+            return create ? generateMethod() : null;
 
+        try {
             return classNode.methods.get(currentMethod);
         } catch (IndexOutOfBoundsException e) {
-            if (create) {
-                MethodNode methodNode = generateMethod();
-
-                try {
-                    classNode.methods.set(currentMethod, methodNode);
-                } catch (IndexOutOfBoundsException ex) {
-                    if (classNode.methods.size() != currentMethod)
-                        return methodNode;
-                    addMethodToMainClass(methodNode);
-                }
-
-                return methodNode;
-            }
+            if (!create)
+                return null;
         }
 
-        return null;
+        return generateMethod();
     }
 
     public ClassNode getCurrentClass() {
@@ -396,7 +390,6 @@ public class Compiler {
             if (previousLastStack == null) {
                 error("Unable to compute last stack");
             }
-            convertLastStackToDouble();
             switch (op) {
                 case TOKEN_BANG_EQUAL -> emitDelayed(DelayedInstruction.INT_NOT_EQUAL);
                 case TOKEN_EQUAL_EQUAL -> emitDelayed(DelayedInstruction.INT_EQUAL);
@@ -405,10 +398,22 @@ public class Compiler {
                 case TOKEN_LESS -> emitDelayed(DelayedInstruction.INT_LESS);
                 case TOKEN_LESS_EQUAL -> emitDelayed(DelayedInstruction.INT_LESS_EQUAL);
 
-                case TOKEN_PLUS -> emit(new InsnNode(Opcodes.DADD));
-                case TOKEN_MINUS -> emit(new InsnNode(Opcodes.DSUB));
-                case TOKEN_STAR -> emit(new InsnNode(Opcodes.DMUL));
-                case TOKEN_SLASH -> emit(new InsnNode(Opcodes.DDIV));
+                case TOKEN_PLUS -> {
+                    convertLastStackToDouble();
+                    emit(new InsnNode(Opcodes.DADD));
+                }
+                case TOKEN_MINUS -> {
+                    convertLastStackToDouble();
+                    emit(new InsnNode(Opcodes.DSUB));
+                }
+                case TOKEN_STAR -> {
+                    convertLastStackToDouble();
+                    emit(new InsnNode(Opcodes.DMUL));
+                }
+                case TOKEN_SLASH -> {
+                    convertLastStackToDouble();
+                    emit(new InsnNode(Opcodes.DDIV));
+                }
                 default -> throw op.makeInvalidTokenException(this, "Cannot use %s token with numbers!");
             }
             if (delayedInstruction == null)
@@ -477,24 +482,25 @@ public class Compiler {
     }
 
     public void call(boolean canAssign) {
-        emit(new MethodInsnNode(Opcodes.INVOKESTATIC, getCurrentClass().name, "xabc", Type.getMethodDescriptor(StackTypes.OBJECT_TYPE, argumentList().v.toArray(Type[]::new))));
+        // emit(new MethodInsnNode(Opcodes.INVOKESTATIC, getCurrentClass().name, "xabc", Type.getMethodDescriptor(StackTypes.OBJECT_TYPE, argumentList().v.toArray(Type[]::new))));
     }
 
     public void dot(boolean canAssign) {
         consume(TokenType.TOKEN_IDENTIFIER, "Expect property name after \".\"");
-        String name = parser.getPrevious().content();
+        String afterDot = parser.getPrevious().content();
 
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
-            emit(new FieldInsnNode(Opcodes.PUTFIELD, "", name, "java/lang/Object"));
+            emit(new FieldInsnNode(Opcodes.PUTFIELD, "", afterDot, peekLastStack().getDescriptor()));
+        } else {
+            emit(new FieldInsnNode(Opcodes.GETFIELD, "", afterDot, peekLastStack().getDescriptor()));
         }
     }
 
     public void variable(boolean canAssign) {
-        String identifier = parser.getPrevious().content();
+        final String identifier = parser.getPrevious().content();
 
         Local local = locals.get(identifier);
-
 
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
@@ -509,20 +515,63 @@ public class Compiler {
         } else {
             if (match(TokenType.TOKEN_RIGHT_BRACE) &&
                     identifier.equals(getCurrentMethod().name)) {
-                // TODO Fix the bug of why the code reach here
+                // TODO: Fix the bug of why the code reach here
                 // The return is needed to avoid crashes...
                 return;
             }
 
-            if (!match(TokenType.TOKEN_LEFT_PAREN) &&
-                    getCurrentClass().methods.stream().noneMatch(m -> identifier.equals(m.name))) {
-                if (local == null) {
-                    errorAtCurrent("Variable \"" + identifier + "\" does not exist");
+            if (!match(TokenType.TOKEN_LEFT_PAREN)) {
+                if (importedModules.stream().anyMatch(x -> identifier.equals(x.name()))) {
+                    if (!match(TokenType.TOKEN_DOT)) return;
+
+                    BuiltInModuleRegistry.BuiltInModule module = importedModules.stream().filter(x -> identifier.equals(x.name())).findFirst().get();
+                    consume(TokenType.TOKEN_IDENTIFIER, "Expect identifier after \".\"");
+
+                    final String method = parser.getPrevious().content();
+
+                    if (!match(TokenType.TOKEN_LEFT_PAREN)) {
+                        BuiltInModuleRegistry.BuiltInModule.BuiltInField field = module.findField(method);
+                        if (field == null) {
+                            errorAtCurrent("Field \"" + identifier + "\" does not exist");
+                            return;
+                        }
+
+                        field.append().accept(this);
+
+                        return;
+                    }
+
+                    final int arity = argumentList().k;
+                    if (arity < currentStack.size()) {
+                        error("Calling method with " + arity + " argument, " +
+                                "but stack only has " + currentStack.size());
+                    }
+                    BuiltInFunctionRegistry.BuiltInFunction builtInFunction = module.findBuiltInFunction(method, arity);
+
+                    if (builtInFunction != null) {
+                        Type[] types = builtInFunction.description().getArgumentTypes();
+                        if (types.length != 0)
+                            convertLastStackForType(types[types.length - 1]);
+
+                        builtInFunction.append().accept(this, canAssign);
+
+                        return;
+                    }
+
+                    if (local == null)
+                        errorAtCurrent("Method \"" + identifier + "\" does not exist");
+                }
+                if (getCurrentClass().methods.stream().noneMatch(m -> identifier.equals(m.name))) {
+                    if (local == null) {
+                        errorAtCurrent("Variable \"" + identifier + "\" does not exist");
+                        return;
+                    }
+
+                    emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
+                    notifyPushStack(local.type); // PUSH Stack
                     return;
                 }
 
-                emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
-                notifyPushStack(local.type); // PUSH Stack
                 return;
             }
 
@@ -532,7 +581,10 @@ public class Compiler {
                         "but stack only has " + currentStack.size());
             }
             for (MethodNode m : getCurrentClass().methods) {
-                if (!(Modifier.isStatic(m.access) && identifier.equals(m.name))) continue;
+                if (!Modifier.isStatic(m.access))
+                    continue;
+                if (!identifier.equals(m.name))
+                    continue;
 
                 Type[] types = Type.getArgumentTypes(m.desc);
                 if (arity != types.length) continue;
@@ -542,7 +594,11 @@ public class Compiler {
                 for (Type ignored : types)
                     notifyPopStack();
 
-                emit(new MethodInsnNode(Opcodes.INVOKESTATIC, getCurrentClass().name, m.name, m.desc));
+                if ("main".equals(m.name))
+                    emit(new MethodInsnNode(Opcodes.INVOKESTATIC, getCurrentClass().name, "basalt$main", m.desc));
+                else
+                    emit(new MethodInsnNode(Opcodes.INVOKESTATIC, getCurrentClass().name, m.name, m.desc));
+
                 notifyPushStack(Type.getReturnType(m.desc));
 
                 return;
@@ -576,15 +632,20 @@ public class Compiler {
     }
 
     public void and(boolean canAssign) {
-        getCurrentMethod().visitJumpInsn(Opcodes.IFNE, new Label());
 
-        parsePrecedence(Precedence.PREC_AND);
+    }
+
+    public void import_(boolean canAssign) {
+        consume(TokenType.TOKEN_IDENTIFIER, "Expect module after \"import\"");
+        final String type = parser.getPrevious().content();
+
+        System.out.println("Importing \"" + type + "\"");
+        BuiltInModuleRegistry.BuiltInModule module = BuiltInModuleRegistry.findBuiltInModule(type);
+
+        importedModules.add(module);
     }
 
     public void or(boolean canAssign) {
-        getCurrentMethod().visitJumpInsn(Opcodes.IFNE, new Label());
-        getCurrentMethod().visitJumpInsn(Opcodes.IFEQ, new Label());
-
         parsePrecedence(Precedence.PREC_OR);
     }
 
@@ -632,7 +693,7 @@ public class Compiler {
         }
     }
 
-    private void convertLastStackToDouble() {
+    public void convertLastStackToDouble() {
         Type lastStack = requireLastStack();
         if (StackTypes.isTypeStackDouble(lastStack))
             return;
@@ -663,8 +724,7 @@ public class Compiler {
             return;
         }
         if (StackTypes.isTypeStackPureObject(lastStack)) {
-            emit(new TypeInsnNode(Opcodes.CHECKCAST, "java/lang/Number"));
-            emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/Number", "doubleValue", "()D"));
+            emit(new TypeInsnNode(Opcodes.CHECKCAST, "double"));
             notifyReplaceLastStack(StackTypes.DOUBLE);
             return;
         }
@@ -738,14 +798,10 @@ public class Compiler {
             emitConstant("null");
             return;
         }
-        if (StackTypes.isTypeStackString(lastStack)) return;
-        if (StackTypes.isTypeStackObject(lastStack)) {
-            emit(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/String",
-                    "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;"));
-        } else {
-            emit(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/String",
-                    "valueOf", "(" + lastStack.getDescriptor() + ")Ljava/lang/String;"));
-        }
+        if (StackTypes.isTypeStackString(lastStack))
+            return;
+        emit(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/String",
+                "valueOf", "(" + lastStack.getDescriptor() + ")Ljava/lang/String;"));
         notifyReplaceLastStack(StackTypes.STRING_TYPE);
     }
 
@@ -802,11 +858,15 @@ public class Compiler {
     public void funDeclaration() {
         String name = parseIdentifier("Expect function name");
 
-        Compiler compiler = new Compiler(this);
+        if (name.equals("main"))
+            name = "basalt$main";
 
         consume(TokenType.TOKEN_LEFT_PAREN, "Expect \"(\" after function name");
 
         int arity = 0;
+
+        final Compiler compiler = new Compiler(this);
+        compiler.currentMethod = getCurrentClass().methods.size();
 
         final List<Type> locals = new ArrayList<>();
         if (!check(TokenType.TOKEN_RIGHT_PAREN)) {
@@ -826,31 +886,28 @@ public class Compiler {
 
         consume(TokenType.TOKEN_RIGHT_PAREN, "Expect \")\" after parameters");
 
+        String type = consumeType("Expect return type after \":\"");
+
+        final MethodNode methodNode = compiler.getCurrentMethod(true);
+
+        methodNode.name = name;
+        methodNode.desc = Type.getMethodDescriptor(StackTypes.getTypeFromClassName(type), locals.toArray(Type[]::new));
+
+        addMethodToCurrentClass(methodNode);
+
         consume(TokenType.TOKEN_LEFT_BRACE, "Expect \"{\" before function body");
 
         compiler.block();
 
         compiler.emitReturn();
 
-        MethodNode methodNode = compiler.getCurrentMethod(true);
-
-        methodNode.name = name;
-        methodNode.desc = Type.getMethodDescriptor(StackTypes.OBJECT_TYPE, locals.toArray(Type[]::new));
-
-        addMethodToMainClass(methodNode);
-
         // name/desc was defined here before
     }
 
-    public void addMethodToMainClass(MethodNode methodNode) {
-       if (methodExistsInClass(getCurrentClass(), methodNode.name))
-            getCurrentClass().methods.removeIf(x -> Objects.equals(methodNode.name, x.name));
+    public void addMethodToCurrentClass(MethodNode methodNode) {
+        getCurrentClass().methods.removeIf(x -> Objects.equals(methodNode.name, x.name) && Objects.equals(methodNode.desc, x.desc));
 
         getCurrentClass().methods.add(methodNode);
-    }
-
-    private boolean methodExistsInClass(ClassNode classNode, String methodName) {
-        return classNode.methods.stream().anyMatch(x -> Objects.equals(x.name, methodName));
     }
 
     public void optionalConsume(TokenType type) {
@@ -896,8 +953,20 @@ public class Compiler {
             emitNullReturn();
         else {
             expression();
-            convertLastStackToObject();
-            emit(new InsnNode(Opcodes.ARETURN));
+
+            Type returnType = Type.getReturnType(getCurrentMethod().desc);
+
+            if (StackTypes.isTypeStackInt(returnType))
+                emit(new InsnNode(Opcodes.IRETURN));
+            if (StackTypes.isTypeStackFloat(returnType))
+                emit(new InsnNode(Opcodes.FRETURN));
+            if (StackTypes.isTypeStackLong(returnType))
+                emit(new InsnNode(Opcodes.LRETURN));
+            if (StackTypes.isTypeStackDouble(returnType))
+                emit(new InsnNode(Opcodes.DRETURN));
+            if (StackTypes.isTypeStackObject(returnType))
+                emit(new InsnNode(Opcodes.ARETURN));
+
             consume(TokenType.TOKEN_SEMICOLON, "Expect \";\" after \"return\"");
         }
     }
@@ -907,6 +976,8 @@ public class Compiler {
             returnStatement();
         else if (match(TokenType.TOKEN_LEFT_BRACE))
             block();
+        else if (match(TokenType.TOKEN_WHILE))
+            whileStatement();
         else {
             expressionStatement();
         }
@@ -958,6 +1029,25 @@ public class Compiler {
         clearStack();
     }
 
+    public void whileStatement() {
+        consume(TokenType.TOKEN_RIGHT_PAREN, "Expect \"(\" after \"while\"");
+
+        expression();
+        Type type = peekLastStack();
+        if (!StackTypes.isTypeStackBoolean(type))
+            return;
+
+        consume(TokenType.TOKEN_LEFT_PAREN, "Expect \")\" after condition");
+
+        consume(TokenType.TOKEN_LEFT_BRACE, "Expect \"{\" before function body");
+
+        LabelNode labelNode = new LabelNode();
+
+        emitIfEq(labelNode);
+        block();
+        emit(labelNode);
+    }
+
     public void synchronize() {
         parser.setPanicMode(false);
 
@@ -981,31 +1071,16 @@ public class Compiler {
         parser.setHadError(false);
         parser.setPanicMode(false);
 
-        if (type == CompilerType.MAIN) {
-            MethodNode methodNode = getCurrentMethod(true);
-
-            methodNode.name = "main";
-            methodNode.desc = "([Ljava/lang/String;)V";
-
-            advance();
-
-            while (!match(TokenType.TOKEN_EOF)) {
-                declaration();
-            }
-
-            emitReturn();
-
-            addMethodToMainClass(getCurrentMethod());
-
-            clearStack();
-
-            return;
-        }
-
         advance();
 
         while (!match(TokenType.TOKEN_EOF)) {
             declaration();
+        }
+
+        if (type == CompilerType.MAIN) {
+            emitReturn();
+
+            System.out.println(getCurrentClass().methods.stream().map(x -> x.name + x.desc).toList());
         }
 
         clearStack();

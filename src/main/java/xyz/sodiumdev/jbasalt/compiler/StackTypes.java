@@ -23,6 +23,7 @@ public final class StackTypes {
     public static final Type INTEGER_TYPE = Type.getType(Integer.class);
     public static final Type DOUBLE_TYPE = Type.getType(Double.class);
     public static final Type FLOAT_TYPE = Type.getType(Float.class);
+    public static final Type LONG_TYPE = Type.getType(Long.class);
 
     public static Type getTypeFromClassName(final String className) {
         return switch (className) {
@@ -40,6 +41,7 @@ public final class StackTypes {
             case "java/lang/Class", "java.lang.Class" -> CLASS_TYPE;
             case "java/lang/Integer", "java.lang.Integer" -> INTEGER_TYPE;
             case "java/lang/Float", "java.lang.Float" -> FLOAT_TYPE;
+            case "java/lang/Long", "java.lang.Long" -> LONG_TYPE;
             case "java/lang/Double", "java.lang.Double" -> DOUBLE_TYPE;
             default -> Type.getObjectType(className);
         };
@@ -72,11 +74,11 @@ public final class StackTypes {
     }
 
     public static boolean isTypeStackDouble(Type type) {
-        return type == DOUBLE_TYPE || type == DOUBLE;
+        return type == DOUBLE;
     }
 
     public static boolean isTypeStackFloat(Type type) {
-        return type == FLOAT || type == FLOAT_TYPE;
+        return type == FLOAT;
     }
 
     public static boolean isTypeStackLong(Type type) {
@@ -104,5 +106,9 @@ public final class StackTypes {
 
     public static boolean isTypeStackIntegerType(Type type) {
         return INTEGER_TYPE.equals(type);
+    }
+
+    public static boolean isTypeStackBoolean(Type type) {
+        return BOOLEAN.equals(type);
     }
 }

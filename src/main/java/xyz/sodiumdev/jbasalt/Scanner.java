@@ -27,6 +27,7 @@ public class Scanner {
         keywords.put("true",   TokenType.TOKEN_TRUE);
         keywords.put("let",    TokenType.TOKEN_LET);
         keywords.put("while",  TokenType.TOKEN_WHILE);
+        keywords.put("import", TokenType.IMPORT);
     }
 
     public Scanner() {}

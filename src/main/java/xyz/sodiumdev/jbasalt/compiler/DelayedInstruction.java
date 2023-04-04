@@ -54,6 +54,42 @@ public enum DelayedInstruction {
         public DelayedInstruction invert() {
             return INT_GREATER;
         }
+    },
+    EQUAL(Opcodes.IFEQ) {
+        @Override
+        public DelayedInstruction invert() {
+            return NOT_EQUAL;
+        }
+    },
+    NOT_EQUAL(Opcodes.IFNE) {
+        @Override
+        public DelayedInstruction invert() {
+            return EQUAL;
+        }
+    },
+    GREATER_EQUAL(Opcodes.IFGE) {
+        @Override
+        public DelayedInstruction invert() {
+            return LESS_THAN;
+        }
+    },
+    GREATER_THAN(Opcodes.IFGT) {
+        @Override
+        public DelayedInstruction invert() {
+            return LESS_EQUAL;
+        }
+    },
+    LESS_EQUAL(Opcodes.IFLE) {
+        @Override
+        public DelayedInstruction invert() {
+            return GREATER_THAN;
+        }
+    },
+    LESS_THAN(Opcodes.IFLT) {
+        @Override
+        public DelayedInstruction invert() {
+            return GREATER_EQUAL;
+        }
     };
 
     private final int opcode;

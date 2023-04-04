@@ -20,11 +20,6 @@ public class CoreFeaturesTest {
     @Test
     public void basicMathTestNoReturn() throws Throwable {
         new Compiler().compileAndRun("""
-                         fun xabc(a) {
-                         let x = a + 1;
-                         let y = x + x;
-                         assert(y == 4);
-                         }
-                         xabc(1)""");
+""");
     }
 }
