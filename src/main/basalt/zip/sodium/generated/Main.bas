@@ -1,23 +1,22 @@
 import java.lang.String
 import java.lang.Object
 
-import basalt.annotations.jvm.Public
-import basalt.annotations.jvm.Final
-import basalt.annotations.jvm.Static
-
-import basalt.annotations.Magic
-
-import basalt.lang.STD
+import basalt.lang.STDLib
 
 import zip.sodium.generated.Library
 
-@Public
-class Main {
-    @Public
-    @Static
-    fn main(args: String[]): void {
+public class Main {
+    public static fn main(args: String[]): void {
         let a: Library = Library:new()
 
-        STD.assertThat(<boolean> (a + 1))
+        private static fn child(): void {
+            private static fn grandChild(): void {
+                STDLib.println("Hello World!")
+            }
+
+            grandChild()
+        }
+
+        STDLib.println(a(1))
     }
 }

@@ -29,6 +29,11 @@ public class Scanner {
         keywords.put("const",  TokenType.TOKEN_CONST);
         keywords.put("while",  TokenType.TOKEN_WHILE);
         keywords.put("import", TokenType.TOKEN_IMPORT);
+        keywords.put("public", TokenType.TOKEN_PUBLIC);
+        keywords.put("static", TokenType.TOKEN_STATIC);
+        keywords.put("final",  TokenType.TOKEN_FINAL);
+        keywords.put("private",TokenType.TOKEN_PRIVATE);
+        keywords.put("magic",  TokenType.TOKEN_MAGIC);
     }
 
     public Scanner() {}

@@ -2,7 +2,7 @@ package basalt.lang;
 
 import java.lang.reflect.Array;
 
-public class STD {
+public class STDLib {
     public static void println(String s) {
         System.out.println(s);
     }

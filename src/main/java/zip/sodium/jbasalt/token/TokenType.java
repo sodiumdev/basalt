@@ -1,5 +1,6 @@
 package zip.sodium.jbasalt.token;
 
+import org.objectweb.asm.Opcodes;
 import zip.sodium.jbasalt.compiler.Compiler;
 
 public enum TokenType {
@@ -24,7 +25,21 @@ public enum TokenType {
     TOKEN_TRUE, TOKEN_LET, TOKEN_CONST, TOKEN_WHILE,
     TOKEN_IMPORT,
 
+    TOKEN_PUBLIC(Opcodes.ACC_PUBLIC), TOKEN_STATIC(Opcodes.ACC_STATIC),
+    TOKEN_FINAL(Opcodes.ACC_FINAL), TOKEN_PRIVATE(Opcodes.ACC_PRIVATE),
+    TOKEN_MAGIC,
+
     TOKEN_ERROR, TOKEN_EOF;
+
+    public final int modifier;
+
+    TokenType() {
+        modifier = 0;
+    }
+
+    TokenType(int i) {
+        modifier = i;
+    }
 
     public InvalidTokenException makeInvalidTokenException(Compiler compiler, String text) {
         return new InvalidTokenException(

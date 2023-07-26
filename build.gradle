@@ -3,7 +3,7 @@ plugins {
     id "com.lazan.java-monkey-patch" version "1.0"
 }
 
-group 'xyz.sodiumdev'
+group 'zip.sodium'
 version '1.0-SNAPSHOT'
 
 repositories {
