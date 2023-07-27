@@ -104,25 +104,25 @@ public enum DelayedInstruction {
             return NUM_NOT_EQUAL;
         }
     },
-    NUM_GREATER(Opcodes.IF_ICMPGT) {
+    NUM_GREATER(Opcodes.IF_ICMPGE) {
         @Override
         public DelayedInstruction invert() {
             return NUM_LESS_EQUAL;
         }
     },
-    NUM_GREATER_EQUAL(Opcodes.IF_ICMPGE) {
+    NUM_GREATER_EQUAL(Opcodes.IF_ICMPGT) {
         @Override
         public DelayedInstruction invert() {
             return NUM_LESS;
         }
     },
-    NUM_LESS(Opcodes.IF_ICMPLT) {
+    NUM_LESS(Opcodes.IF_ICMPLE) {
         @Override
         public DelayedInstruction invert() {
             return NUM_GREATER_EQUAL;
         }
     },
-    NUM_LESS_EQUAL(Opcodes.IF_ICMPLE) {
+    NUM_LESS_EQUAL(Opcodes.IF_ICMPLT) {
         @Override
         public DelayedInstruction invert() {
             return NUM_GREATER;
@@ -164,8 +164,7 @@ public enum DelayedInstruction {
 
     public void applyStackChanges(Compiler compiler) {
         compiler.notifyPopStack();
-        compiler.notifyPopStack();
-        compiler.notifyPushStack(StackTypes.BOOLEAN);
+        compiler.notifyReplaceLastStack(StackTypes.BOOLEAN);
     }
 
     public abstract DelayedInstruction invert();

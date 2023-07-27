@@ -16,7 +16,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
+
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -58,6 +58,7 @@ public class Compiler {
     private final EphemeralRunner runner;
 
     public final String fileName;
+    public final String filePackage;
 
     public record Local(Type type, int index, String signature, LabelNode start) { }
     public record Pair<K, V>(K k, V v) {}
@@ -148,13 +149,14 @@ public class Compiler {
         NESTED_CLASS, NESTED_METHOD,
     }
 
-    public Compiler(String fileName, EphemeralRunner runner) {
+    public Compiler(String filePackage, String fileName, EphemeralRunner runner) {
         type = CompilerType.TOP;
         parser = new Parser();
         scanner = new Scanner();
 
         this.runner = runner;
         this.fileName = fileName;
+        this.filePackage = filePackage;
 
         runner.setCompiler(this);
     }
@@ -170,6 +172,7 @@ public class Compiler {
 
         runner = parent.runner;
         fileName = parent.fileName;
+        filePackage = parent.filePackage;
     }
 
     @Nullable
@@ -472,8 +475,14 @@ public class Compiler {
                     emitDelayed(DelayedInstruction.F_NOT_EQUAL);
                 else if (StackTypes.isTypeStackInt(previousLastStack) || StackTypes.isTypeStackLong(previousLastStack))
                     emitDelayed(DelayedInstruction.NUM_NOT_EQUAL);
-                else
-                    emitDelayed(DelayedInstruction.OBJECT_NOT_EQUAL);
+                else {
+                    try {
+                        callObject("NOT_EQUAL", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
+                        notifyPushStack(peekLastStack());
+                    } catch (ClassNotFoundException | NoSuchMethodException e) {
+                        emitDelayed(DelayedInstruction.OBJECT_NOT_EQUAL);
+                    }
+                }
             }
             case TOKEN_EQUAL_EQUAL -> {
                 if (StackTypes.isTypeStackDouble(previousLastStack))
@@ -482,8 +491,14 @@ public class Compiler {
                     emitDelayed(DelayedInstruction.F_EQUAL);
                 else if (StackTypes.isTypeStackInt(previousLastStack) || StackTypes.isTypeStackLong(previousLastStack))
                     emitDelayed(DelayedInstruction.NUM_EQUAL);
-                else
-                    emitDelayed(DelayedInstruction.OBJECT_EQUAL);
+                else {
+                    try {
+                        callObject("EQUAL", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
+                    } catch (ClassNotFoundException | NoSuchMethodException e) {
+                        emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/Object", "equals", "(Ljava/lang/Object;)Z"));
+                        notifyReplaceLastStack(Type.BOOLEAN_TYPE);
+                    }
+                }
             }
             case TOKEN_GREATER -> {
                 if (StackTypes.isTypeStackDouble(previousLastStack))
@@ -495,9 +510,8 @@ public class Compiler {
                 else if (StackTypes.isTypeStackPureObject(previousLastStack))
                     try {
                         callObject("GREATER", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
-                        notifyPushStack(peekLastStack());
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
-                        throw new RuntimeException(e);
+                        errorAtCurrent("Can't apply operator GREATER to " + previousLastStack.getInternalName());
                     }
             }
             case TOKEN_GREATER_EQUAL -> {
@@ -512,7 +526,7 @@ public class Compiler {
                         callObject("GREATER_EQUAL", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
                         notifyPushStack(peekLastStack());
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
-                        throw new RuntimeException(e);
+                        errorAtCurrent("Can't apply operator GREATER_EQUAL to " + previousLastStack.getInternalName());
                     }
             }
             case TOKEN_LESS -> {
@@ -527,7 +541,7 @@ public class Compiler {
                         callObject("LESS", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
                         notifyPushStack(peekLastStack());
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
-                        throw new RuntimeException(e);
+                        errorAtCurrent("Can't apply operator LESS to " + previousLastStack.getInternalName());
                     }
             }
             case TOKEN_LESS_EQUAL -> {
@@ -542,7 +556,7 @@ public class Compiler {
                         callObject("LESS_EQUAL", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
                         notifyPushStack(peekLastStack());
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
-                        throw new RuntimeException(e);
+                        errorAtCurrent("Can't apply operator LESS_EQUAL to " + previousLastStack.getInternalName());
                     }
             }
 
@@ -555,7 +569,7 @@ public class Compiler {
                     callObject("ADD", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
                     notifyPushStack(peekLastStack());
                 } catch (ClassNotFoundException | NoSuchMethodException e) {
-                    throw new RuntimeException(e);
+                        errorAtCurrent("Can't apply operator ADD to " + previousLastStack.getInternalName());
                 }
             }
             case TOKEN_MINUS -> {
@@ -565,7 +579,7 @@ public class Compiler {
                     callObject("SUBTRACT", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
                     notifyPushStack(peekLastStack());
                 } catch (ClassNotFoundException | NoSuchMethodException e) {
-                    throw new RuntimeException(e);
+                    errorAtCurrent("Can't apply operator SUBTRACT to " + previousLastStack.getInternalName());
                 }
             }
             case TOKEN_STAR -> {
@@ -575,7 +589,7 @@ public class Compiler {
                     callObject("MULTIPLY", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
                     notifyPushStack(peekLastStack());
                 } catch (ClassNotFoundException | NoSuchMethodException e) {
-                    throw new RuntimeException(e);
+                    errorAtCurrent("Can't apply operator MULTIPLY to " + previousLastStack.getInternalName());
                 }
             }
             case TOKEN_SLASH ->  {
@@ -585,13 +599,11 @@ public class Compiler {
                     callObject("DIVIDE", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
                     notifyPushStack(peekLastStack());
                 } catch (ClassNotFoundException | NoSuchMethodException e) {
-                    throw new RuntimeException(e);
+                    errorAtCurrent("Can't apply operator DIVIDE to " + previousLastStack.getInternalName());
                 }
             }
             default -> throw op.makeInvalidTokenException(this, "Cannot use %s token with numbers!");
         }
-        if (delayedInstruction == null)
-            notifyPopStack();
     }
 
     public void literal(boolean canAssign) {
@@ -1063,6 +1075,55 @@ public class Compiler {
             }
 
             emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+        } else if (canAssign && match(TokenType.TOKEN_PLUS_EQUAL)) {
+            expression();
+
+            if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
+                errorAtCurrent("Variable \"" + identifier + "\" does not exist");
+                return;
+            }
+
+            emit(new VarInsnNode(peekLastStack().getOpcode(Opcodes.ILOAD), local.index));
+            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IADD)));
+
+            emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+        } else if (canAssign && match(TokenType.TOKEN_MINUS_EQUAL)) {
+            expression();
+
+            if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
+                errorAtCurrent("Variable \"" + identifier + "\" does not exist");
+                return;
+            }
+
+            emit(new VarInsnNode(peekLastStack().getOpcode(Opcodes.ILOAD), local.index));
+            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.INEG)));
+            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IADD)));
+
+            emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+        } else if (canAssign && match(TokenType.TOKEN_STAR_EQUAL)) {
+            expression();
+
+            if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
+                errorAtCurrent("Variable \"" + identifier + "\" does not exist");
+                return;
+            }
+
+            emit(new VarInsnNode(peekLastStack().getOpcode(Opcodes.ILOAD), local.index));
+            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IMUL)));
+
+            emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+        } else if (canAssign && match(TokenType.TOKEN_SLASH_EQUAL)) {
+            expression();
+
+            if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
+                errorAtCurrent("Variable \"" + identifier + "\" does not exist");
+                return;
+            }
+
+            emit(new VarInsnNode(peekLastStack().getOpcode(Opcodes.ILOAD), local.index));
+            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IDIV)));
+
+            emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
         } else {
             if (check(TokenType.TOKEN_LEFT_PAREN) && local == null) {
                 notifyPushCallStack(new MethodCall(
@@ -1228,14 +1289,12 @@ public class Compiler {
         } while (match(TokenType.TOKEN_AT));
 
         switch (parser.getCurrent().type()) {
-            case TOKEN_FN -> annotationsForNextElement.addAll(annotations);
-            case TOKEN_CLASS -> annotationsForNextElement.addAll(annotations);
+            case TOKEN_FN, TOKEN_CLASS -> annotationsForNextElement.addAll(annotations);
             case TOKEN_LET -> {
                 if (this.type == CompilerType.CLASS || this.type == CompilerType.NESTED_CLASS)
                     annotationsForNextElement.addAll(annotations);
-                else
-                    ; // annotationsForNextLocal.addAll(annotations);
             }
+            default -> errorAtCurrent("You can not append annotations to this element!");
         }
     }
 
@@ -1248,7 +1307,7 @@ public class Compiler {
         }
 
         switch (parser.getCurrent().type()) {
-            case TOKEN_FN -> modifiersForNextElement.addAll(modifiers);
+            case TOKEN_FN, TOKEN_LET -> modifiersForNextElement.addAll(modifiers);
             case TOKEN_CLASS -> {
                 if (modifiers.contains(TokenType.TOKEN_MAGIC)) {
                     error("A class can not be magic!");
@@ -1258,8 +1317,12 @@ public class Compiler {
 
                 modifiersForNextElement.addAll(modifiers);
             }
-            case TOKEN_LET ->
-                modifiersForNextElement.addAll(modifiers);
+
+            default -> {
+                if (modifiers.isEmpty()) return;
+
+                errorAtCurrent("Element does not support modifiers!");
+            }
         }
     }
 
@@ -1590,7 +1653,7 @@ public class Compiler {
         try {
             return typeStack.pop();
         } catch (EmptyStackException e) {
-            error("Lost track of stack?");
+            errorAtCurrent("Lost track of stack?");
             e.printStackTrace();
         }
 
@@ -1749,7 +1812,6 @@ public class Compiler {
                 name = "<init>";
             else name = parser.getPrevious().content();
         }
-
 
         boolean constructor = name.equals("<init>");
         consume(TokenType.TOKEN_LEFT_PAREN, "Expected \"(\" after function name!");
@@ -1924,7 +1986,7 @@ public class Compiler {
         clearStack();
 
         final LabelNode start = new LabelNode();
-        if (type == CompilerType.METHOD)
+        if (type == CompilerType.METHOD || type == CompilerType.NESTED_METHOD)
             emit(start);
 
         boolean isFieldStatic = !modifiersForNextElement.isEmpty() && modifiersForNextElement.contains(TokenType.TOKEN_STATIC);
@@ -1939,16 +2001,31 @@ public class Compiler {
 
         String name = parseIdentifier("Expect variable name.");
 
-        Pair<String, String> typeName = consumeGenericType("Expect type after parameter name");
+        boolean inference = !match(TokenType.TOKEN_COLON);
 
-        Type type = Type.getType(typeName.k);
+        Pair<String, String> typeName = null;
+        Type type = null;
+        if (!inference) {
+            typeName = new Pair<>(parseType("Expected type name after \":\"."), parseGenericType());
+            type = Type.getType(typeName.k);
+        } else {
+            if (!check(TokenType.TOKEN_EQUAL)) {
+                error("Expected \"=\", can not infer type");
+
+                return;
+            }
+        }
 
         boolean setValue = match(TokenType.TOKEN_EQUAL);
-
         if (setValue) {
             expression();
 
-            convertLastStackForType(type);
+            if (!inference)
+                convertLastStackForType(type);
+            else {
+                type = peekLastStack();
+                typeName = new Pair<>(type.getDescriptor(), "");
+            }
 
             if (typeStack.isEmpty())
                 error("Variable expression doesn't output anything");
@@ -2045,7 +2122,9 @@ public class Compiler {
 
     private Pair<AbstractInsnNode[], Object> captureInstructions(Function<Compiler, Object> consumer) {
         final Compiler compiler = new Compiler(CompilerType.METHOD, this);
-        compiler.getCurrentClass().methods.add(compiler.getCurrentMethod(true));
+        compiler.currentMethod = getCurrentClass().methods.size();
+        compiler.addMethodToCurrentClass(compiler.getCurrentMethod(true));
+
         compiler.locals = locals;
 
         final Object result = consumer.apply(compiler);
@@ -2075,56 +2154,50 @@ public class Compiler {
     }
 
     public void forStatement() {
-        if (match(TokenType.TOKEN_SEMICOLON)) {
-            // No initializer.
-        } else if (match(TokenType.TOKEN_LET)) {
+        if (match(TokenType.TOKEN_LET))
             varDeclaration(true);
-        } else {
-            expressionStatement(true);
+        else consume(TokenType.TOKEN_SEMICOLON, "Expected \";\"");
+
+        LabelNode l0 = new LabelNode();
+        LabelNode l1 = new LabelNode();
+        emit(l0);
+
+        expression();
+        DelayedInstruction delayedInstruction = this.delayedInstruction;
+        System.out.println(delayedInstruction);
+        this.delayedInstruction = null;
+        if (delayedInstruction != null)
+            delayedInstruction.emitJump(this, l1);
+
+        consume(TokenType.TOKEN_SEMICOLON, "Expect \";\"");
+        if (!StackTypes.isTypeStackBoolean(notifyPopStack())) {
+            error("Last stack is not a boolean!");
+
+            return;
         }
 
-        LabelNode labelNode = new LabelNode();
-        emit(labelNode);
-
-        AtomicReference<Local> local = new AtomicReference<>();
-
-        LabelNode start = new LabelNode();
-        emit(start);
-
-        Pair<AbstractInsnNode[], Object> lateInstructions = captureInstructions(compiler -> {
+        AbstractInsnNode[] nodes = captureInstructions(compiler -> {
             compiler.expression();
-            compiler.consume(TokenType.TOKEN_SEMICOLON, "Expect \";\"");
-
-            local.set(new Local(StackTypes.BOOLEAN, maxLocals, null, start));
-            maxLocals += StackTypes.BOOLEAN.getSize();
-            compiler.emit(new VarInsnNode(Opcodes.ISTORE, local.get().index));
-
             return null;
-        });
+        }).k;
+        clearStack();
 
-        Pair<AbstractInsnNode[], Object> lateInstructionsTwo = captureInstructions(compiler -> {
-            compiler.expression();
-            compiler.consume(TokenType.TOKEN_SEMICOLON, "Expect \";\"");
+        if (match(TokenType.TOKEN_LEFT_BRACE))
+            block();
+        else declaration();
 
-            return null;
-        });
-
-        statement();
-
-        emit(lateInstructionsTwo.k);
-        emit(lateInstructions.k);
-
-        emit(new VarInsnNode(Opcodes.ILOAD, local.get().index));
-        notifyPushStack(StackTypes.BOOLEAN);
-
-        emitIfNe(labelNode);
+        emit(nodes);
+        emit(new JumpInsnNode(Opcodes.GOTO, l0));
+        emit(l1);
     }
 
     public void ifStatement() {
         expression();
-        Type type = peekLastStack();
-        if (!StackTypes.isTypeStackBoolean(type))
+        if (!StackTypes.isTypeStackBoolean(peekLastStack())) {
+            error("Last stack is not a boolean!");
+
             return;
+        }
 
         LabelNode labelNode = new LabelNode();
         LabelNode end = new LabelNode();
@@ -2160,7 +2233,7 @@ public class Compiler {
 
         classNode.version = Opcodes.V1_8;
         classNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
-        classNode.name = "zip/sodium/generated/%s".formatted(className);
+        classNode.name = (filePackage.replace(".", "/") + "/%s").formatted(className);
         classNode.superName = "java/lang/Object";
 
         if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC)) {
@@ -2207,7 +2280,7 @@ public class Compiler {
         compiler.consume(TokenType.TOKEN_IDENTIFIER, "Expect class name");
         final String className = compiler.parser.getPrevious().content();
 
-        final String innerClassName = "zip/sodium/generated/%s".formatted(currentClass + "$" + className);
+        final String innerClassName = (filePackage.replace(".", "/") + "/%s").formatted(currentClass + "$" + className);
 
         ClassNode classNode = new ClassNode();
 
@@ -2218,7 +2291,7 @@ public class Compiler {
 
         classNode.version = Opcodes.V1_8;
         classNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
-        classNode.name = "zip/sodium/generated/%s".formatted(className);
+        classNode.name = (filePackage.replace(".", "/") + "/%s").formatted(className);
         classNode.superName = "java/lang/Object";
 
         if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC)) {
@@ -2294,15 +2367,13 @@ public class Compiler {
         emit(start);
 
         expression();
-        Type lastStack = peekLastStack();
-        if (!StackTypes.isTypeStackBoolean(lastStack))
+        if (!StackTypes.isTypeStackBoolean(peekLastStack()))
             return;
-        convertLastStackToInteger();
-
-        consume(TokenType.TOKEN_LEFT_BRACE, "Expect \"{\" before body");
 
         emitIfEq(end);
-        block();
+        if (match(TokenType.TOKEN_LEFT_BRACE))
+            block();
+        else declaration();
         emit(new JumpInsnNode(Opcodes.GOTO, start));
 
         emit(end);
@@ -2375,8 +2446,8 @@ public class Compiler {
     public static void compileAndRun(String source, String... arguments) throws InvocationTargetException {
         EphemeralRunner runner = new EphemeralRunner();
 
-        new Compiler("none", runner).compileToEphemeralRunner(source);
+        new Compiler("zip.sodium.generated", "Main", runner).compileToEphemeralRunner(source);
 
-        runner.runMain(arguments);
+        runner.run("zip.sodium.generated.Main", arguments);
     }
 }

@@ -11,14 +11,11 @@ import java.lang.reflect.InvocationTargetException;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.function.BiConsumer;
-import java.util.function.Consumer;
 
 public class EphemeralRunner extends ClassLoader {
     public final Map<String, byte[]> classes = new LinkedHashMap<>();
     private final Map<String, Class<?>> emulatedClassInstances = new HashMap<>();
 
-    private Compiler compiler;
     private CompileFunction compileFunction;
 
     public EphemeralRunner() {
@@ -29,7 +26,10 @@ public class EphemeralRunner extends ClassLoader {
     protected Class<?> findClass(String name) throws ClassNotFoundException {
         if (!classes.containsKey(name)) {
             try {
-                compileFunction.apply(this, new File(Main.inDir, name));
+                System.out.println();
+                compileFunction.apply(this, new File(Main.inDir, name.replace(".", "/") + ".bas"));
+
+                return findClass(name);
             } catch (IOException ignored) {}
 
             return super.findClass(name);
@@ -50,20 +50,19 @@ public class EphemeralRunner extends ClassLoader {
         return super.getResourceAsStream(name);
     }
 
-    public void runMain(String... args) throws InvocationTargetException {
+    public void run(String className, String... args) throws InvocationTargetException {
         try {
-            this.loadClass("zip.sodium.generated.Main")
+            this.loadClass(className)
                     .getDeclaredMethod("main", String[].class)
                     .invoke(null, (Object) args);
         } catch (NoSuchMethodException | ClassNotFoundException |
                  IllegalAccessException | Error e) {
             throw new InvocationTargetException(e, "Invalid class format \n" +
-                    DebugUtils.classDataToDebug(classes.get("zip.sodium.generated.Main")));
+                    DebugUtils.classDataToDebug(classes.get(className)));
         }
     }
 
     public void setCompiler(Compiler compiler) {
-        this.compiler = compiler;
     }
 
     public void setCompileFunction(CompileFunction compileFunction) {

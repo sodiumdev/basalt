@@ -1,6 +1,10 @@
 package zip.sodium.jbasalt;
 
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.filefilter.DirectoryFileFilter;
+import org.apache.commons.io.filefilter.RegexFileFilter;
+import org.apache.commons.lang3.StringUtils;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.MethodVisitor;
@@ -11,6 +15,8 @@ import zip.sodium.jbasalt.compiler.Compiler;
 import zip.sodium.jbasalt.compiler.EphemeralRunner;
 
 import java.io.*;
+import java.util.Arrays;
+import java.util.Collection;
 
 public class Main {
     private static void deleteContentsOfFolder(File folder) {
@@ -30,31 +36,42 @@ public class Main {
     private static final File outDir;
     public static final File inDir;
 
-    private static File[] files;
+    private static final Collection<File> files;
 
     static {
         deleteContentsOfFolder(new File("build/classes/basalt/"));
 
-        outDir = new File("build/classes/basalt/main/zip/sodium/generated/");
-        inDir = new File("src/main/basalt/zip/sodium/generated/");
+        outDir = new File("build/classes/basalt/main/");
+        inDir = new File("src/main/basalt/");
 
         outDir.mkdirs();
         inDir.mkdirs();
 
-        files = inDir.listFiles();
-        if (files == null)
-            files = new File[0];
+        files = FileUtils.listFiles(
+                inDir,
+                new RegexFileFilter("^(.*?)\\.bas$"),
+                DirectoryFileFilter.DIRECTORY
+        );
+        System.out.println(files);
     }
 
     private static void compileFile(EphemeralRunner runner, File f) throws IOException {
-        final Compiler compiler = new Compiler(f.getName(), runner);
+        String filePackage = StringUtils.replaceOnce(f.getParentFile().getPath(), inDir.getPath(), "");
+        try {
+            filePackage = filePackage.substring(1);
+        } catch (IndexOutOfBoundsException ignored) {}
 
-        try (FileInputStream din = new FileInputStream(new File(inDir, f.getName()))) {
+        File outDir = new File(Main.outDir, filePackage);
+        outDir.mkdirs();
+
+        final Compiler compiler = new Compiler(filePackage.replace("\\", "."), f.getName(), runner);
+
+        try (FileInputStream din = new FileInputStream(f)) {
             compiler.compileToEphemeralRunner(new String(din.readAllBytes()));
         }
 
         try (FileOutputStream dout = new FileOutputStream(new File(outDir, FilenameUtils.removeExtension(f.getName()) + ".class"))) {
-            dout.write(runner.classes.get("zip.sodium.generated." + FilenameUtils.removeExtension(f.getName())));
+            dout.write(runner.classes.get(filePackage.replace("\\", ".") + "." + FilenameUtils.removeExtension(f.getName())));
         }
 
         for (InnerClassNode innerClass : compiler.getCurrentClass().innerClasses) {
@@ -83,6 +100,13 @@ public class Main {
     }
 
     public static void main(String[] args) throws IOException, ReflectiveOperationException {
+        if (args.length == 0) {
+            System.err.println("Please specify the main class in the first argument");
+
+            System.exit(-1);
+            return;
+        }
+
         final EphemeralRunner runner = new EphemeralRunner();
         runner.setCompileFunction(Main::compileFile);
 
@@ -91,6 +115,6 @@ public class Main {
         for (File f : files)
             compileFile(runner, f);
 
-        runner.runMain(args);
+        runner.run(args[0], Arrays.copyOfRange(args, 1, args.length));
     }
 }
