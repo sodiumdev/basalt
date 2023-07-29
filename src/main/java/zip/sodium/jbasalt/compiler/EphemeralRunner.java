@@ -18,20 +18,13 @@ public class EphemeralRunner extends ClassLoader {
 
     private CompileFunction compileFunction;
 
-    public EphemeralRunner() {
-        super(EphemeralRunner.class.getClassLoader());
+    public EphemeralRunner(ClassLoader parent) {
+        super(parent);
     }
 
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
         if (!classes.containsKey(name)) {
-            try {
-                System.out.println();
-                compileFunction.apply(this, new File(Main.inDir, name.replace(".", "/") + ".bas"));
-
-                return findClass(name);
-            } catch (IOException ignored) {}
-
             return super.findClass(name);
         }
 

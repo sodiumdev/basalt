@@ -29,7 +29,7 @@ public class Scanner {
         keywords.put("const",  TokenType.TOKEN_CONST);
         keywords.put("while",  TokenType.TOKEN_WHILE);
         keywords.put("import", TokenType.TOKEN_IMPORT);
-        keywords.put("public", TokenType.TOKEN_PUBLIC);
+        keywords.put("inline", TokenType.TOKEN_INLINE);
         keywords.put("static", TokenType.TOKEN_STATIC);
         keywords.put("final",  TokenType.TOKEN_FINAL);
         keywords.put("private",TokenType.TOKEN_PRIVATE);
@@ -84,7 +84,7 @@ public class Scanner {
             case '*' -> makeToken(match('=') ? TokenType.TOKEN_STAR_EQUAL : TokenType.TOKEN_STAR);
             case '/' -> makeToken(match('=') ? TokenType.TOKEN_SLASH_EQUAL : TokenType.TOKEN_SLASH);
             case '@' -> makeToken(TokenType.TOKEN_AT);
-            case '?' -> makeToken(TokenType.TOKEN_QMARK);
+            case '?' -> makeToken(match('.') ? TokenType.TOKEN_QDOT : TokenType.TOKEN_QMARK);
 
             case '!' -> makeToken(match('=') ? TokenType.TOKEN_BANG_EQUAL : TokenType.TOKEN_BANG);
             case '=' -> makeToken(match('=') ? TokenType.TOKEN_EQUAL_EQUAL : TokenType.TOKEN_EQUAL);

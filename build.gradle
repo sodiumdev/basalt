@@ -32,6 +32,8 @@ dependencies {
 
     implementation 'commons-io:commons-io:2.13.0'
     implementation 'org.apache.commons:commons-lang3:3.12.0'
+
+    implementation "org.zeroturnaround:zt-zip:1.15"
 }
 
 test {

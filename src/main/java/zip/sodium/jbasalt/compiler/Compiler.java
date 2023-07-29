@@ -1,5 +1,6 @@
-package zip.sodium.jbasalt.compiler;
+ package zip.sodium.jbasalt.compiler;
 
+import basalt.lang.Inline;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.objectweb.asm.*;
@@ -11,6 +12,7 @@ import zip.sodium.jbasalt.token.Token;
 import zip.sodium.jbasalt.token.TokenType;
 import zip.sodium.jbasalt.type.ClassType;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -25,6 +27,7 @@ import java.util.stream.Collectors;
 
 public class Compiler {
     private static final String MAGIC_PREFIX = "magic^";
+    private static final AnnotationNode INLINE_ANNOTATION = new AnnotationNode("Lbasalt/lang/Inline;");
 
     private CompilerType type;
     public Parser parser;
@@ -36,7 +39,7 @@ public class Compiler {
                     byte.class, short.class, int.class,
                     float.class, long.class, double.class);
 
-    private static final Map<String, String> classNameReplacements = new HashMap<>();
+    private final Map<String, String> classNameReplacements = new HashMap<>();
     private final Map<String, String> methodNameReplacements = new HashMap<>();
 
     private static final Set<AnnotationNode> annotationsForNextElement = new HashSet<>();
@@ -62,6 +65,12 @@ public class Compiler {
 
     public record Local(Type type, int index, String signature, LabelNode start) { }
     public record Pair<K, V>(K k, V v) {}
+
+    public record InlineMethod(String owner, String name, String methodDescriptor) {}
+    public record InlineField(String owner, String name, Type type) {}
+
+    private final List<InlineMethod> inlineMethods = new ArrayList<>();
+    private final List<InlineField> inlineFields = new ArrayList<>();
 
     /**
      * - {@link #callStack}
@@ -105,10 +114,12 @@ public class Compiler {
         rules.put(TokenType.TOKEN_ELSE, ParseRule.NULL);
 
         rules.put(TokenType.TOKEN_STATIC, ParseRule.NULL);
-        rules.put(TokenType.TOKEN_PUBLIC, ParseRule.NULL);
         rules.put(TokenType.TOKEN_PRIVATE, ParseRule.NULL);
         rules.put(TokenType.TOKEN_FINAL, ParseRule.NULL);
         rules.put(TokenType.TOKEN_MAGIC, ParseRule.NULL);
+        rules.put(TokenType.TOKEN_INLINE, ParseRule.NULL);
+
+        rules.put(TokenType.TOKEN_QDOT, new ParseRule(null, Compiler::qDot, Precedence.PREC_CALL));
 
         rules.put(TokenType.TOKEN_QMARK, new ParseRule(null, Compiler::ternary, Precedence.PREC_CALL));
 
@@ -173,6 +184,11 @@ public class Compiler {
         runner = parent.runner;
         fileName = parent.fileName;
         filePackage = parent.filePackage;
+
+        classNameReplacements.putAll(parent.classNameReplacements);
+        methodNameReplacements.putAll(parent.classNameReplacements);
+        inlineMethods.addAll(parent.inlineMethods);
+        inlineFields.addAll(parent.inlineFields);
     }
 
     @Nullable
@@ -477,8 +493,8 @@ public class Compiler {
                     emitDelayed(DelayedInstruction.NUM_NOT_EQUAL);
                 else {
                     try {
-                        callObject("NOT_EQUAL", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
-                        notifyPushStack(peekLastStack());
+                        callObject("eq", previousLastStack, typeToClass(lastStack));
+
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
                         emitDelayed(DelayedInstruction.OBJECT_NOT_EQUAL);
                     }
@@ -493,7 +509,7 @@ public class Compiler {
                     emitDelayed(DelayedInstruction.NUM_EQUAL);
                 else {
                     try {
-                        callObject("EQUAL", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
+                        callObject("eq", previousLastStack, typeToClass(lastStack));
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
                         emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/Object", "equals", "(Ljava/lang/Object;)Z"));
                         notifyReplaceLastStack(Type.BOOLEAN_TYPE);
@@ -509,7 +525,7 @@ public class Compiler {
                     emitDelayed(DelayedInstruction.NUM_GREATER);
                 else if (StackTypes.isTypeStackPureObject(previousLastStack))
                     try {
-                        callObject("GREATER", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
+                        callObject("gt", previousLastStack, typeToClass(lastStack));
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
                         errorAtCurrent("Can't apply operator GREATER to " + previousLastStack.getInternalName());
                     }
@@ -523,8 +539,7 @@ public class Compiler {
                     emitDelayed(DelayedInstruction.NUM_GREATER_EQUAL);
                 else if (StackTypes.isTypeStackPureObject(previousLastStack))
                     try {
-                        callObject("GREATER_EQUAL", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
-                        notifyPushStack(peekLastStack());
+                        callObject("ge", previousLastStack, typeToClass(lastStack));
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
                         errorAtCurrent("Can't apply operator GREATER_EQUAL to " + previousLastStack.getInternalName());
                     }
@@ -538,8 +553,7 @@ public class Compiler {
                     emitDelayed(DelayedInstruction.NUM_LESS);
                 else if (StackTypes.isTypeStackPureObject(previousLastStack))
                     try {
-                        callObject("LESS", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
-                        notifyPushStack(peekLastStack());
+                        callObject("lt", previousLastStack, typeToClass(lastStack));
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
                         errorAtCurrent("Can't apply operator LESS to " + previousLastStack.getInternalName());
                     }
@@ -553,8 +567,7 @@ public class Compiler {
                     emitDelayed(DelayedInstruction.NUM_LESS_EQUAL);
                 else if (StackTypes.isTypeStackPureObject(previousLastStack))
                     try {
-                        callObject("LESS_EQUAL", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
-                        notifyPushStack(peekLastStack());
+                        callObject("le", previousLastStack, typeToClass(lastStack));
                     } catch (ClassNotFoundException | NoSuchMethodException e) {
                         errorAtCurrent("Can't apply operator LESS_EQUAL to " + previousLastStack.getInternalName());
                     }
@@ -566,8 +579,7 @@ public class Compiler {
                 else if (!StackTypes.isTypeStackPureObject(previousLastStack))
                     emit(new InsnNode(previousLastStack.getOpcode(Opcodes.IADD)));
                 else try {
-                    callObject("ADD", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
-                    notifyPushStack(peekLastStack());
+                    callObject("add", previousLastStack, typeToClass(lastStack));
                 } catch (ClassNotFoundException | NoSuchMethodException e) {
                         errorAtCurrent("Can't apply operator ADD to " + previousLastStack.getInternalName());
                 }
@@ -576,8 +588,7 @@ public class Compiler {
                 if (!StackTypes.isTypeStackPureObject(previousLastStack))
                     emit(new InsnNode(previousLastStack.getOpcode(Opcodes.ISUB)));
                 else try {
-                    callObject("SUBTRACT", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
-                    notifyPushStack(peekLastStack());
+                    callObject("subtract", previousLastStack, typeToClass(lastStack));
                 } catch (ClassNotFoundException | NoSuchMethodException e) {
                     errorAtCurrent("Can't apply operator SUBTRACT to " + previousLastStack.getInternalName());
                 }
@@ -586,8 +597,7 @@ public class Compiler {
                 if (!StackTypes.isTypeStackPureObject(previousLastStack))
                     emit(new InsnNode(previousLastStack.getOpcode(Opcodes.IMUL)));
                 else try {
-                    callObject("MULTIPLY", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
-                    notifyPushStack(peekLastStack());
+                    callObject("multiply", previousLastStack, typeToClass(lastStack));
                 } catch (ClassNotFoundException | NoSuchMethodException e) {
                     errorAtCurrent("Can't apply operator MULTIPLY to " + previousLastStack.getInternalName());
                 }
@@ -596,8 +606,7 @@ public class Compiler {
                 if (!StackTypes.isTypeStackPureObject(previousLastStack))
                     emit(new InsnNode(previousLastStack.getOpcode(Opcodes.IDIV)));
                 else try {
-                    callObject("DIVIDE", previousLastStack, new Class<?>[] { typeToClass(lastStack) });
-                    notifyPushStack(peekLastStack());
+                    callObject("divide", previousLastStack, typeToClass(lastStack));
                 } catch (ClassNotFoundException | NoSuchMethodException e) {
                     errorAtCurrent("Can't apply operator DIVIDE to " + previousLastStack.getInternalName());
                 }
@@ -923,7 +932,7 @@ public class Compiler {
     public void callMethod(@NotNull MethodCall call) throws ClassNotFoundException {
         int opcode = call.opcode;
         if (Modifier.isStatic(Objects.requireNonNull(getCurrentMethod()).access))
-            opcode = Opcodes.INVOKESTATIC;
+            opcode = opcode == -1 ? Opcodes.INVOKESTATIC : opcode;
         else emit(new VarInsnNode(Opcodes.ALOAD, 0));
 
         final List<Type> args = argumentList();
@@ -956,8 +965,6 @@ public class Compiler {
                 break;
             }
         else for (Method method : Class.forName(call.owner.replace("/", "."), true, runner).getDeclaredMethods()) {
-            if (opcode == Opcodes.INVOKESTATIC && !Modifier.isStatic(method.getModifiers()))
-                continue;
             if (!method.getName().equals(call.name) && !methodNameReplacements.containsValue(call.name))
                 continue;
             if (args.size() != method.getParameterCount())
@@ -986,6 +993,29 @@ public class Compiler {
         final Type returnType = Type.getReturnType(descriptor);
 
         emit(new MethodInsnNode(opcode, call.owner, call.name, descriptor));
+
+        notifyPushStack(returnType);
+    }
+
+    public void callInlineMethod(String identifier) {
+        final List<Type> args = argumentList();
+
+        final List<InlineMethod> clone = new ArrayList<>(inlineMethods);
+        Collections.reverse(clone);
+
+        InlineMethod method = clone.stream().filter(x ->
+                x.name.equals(identifier)
+                        && Type.getArgumentTypes(x.methodDescriptor).length == args.size()
+        ).findFirst().orElseThrow();
+
+        for (int i = 0; i < args.size(); i++) {
+            convertLastStackForType(Type.getArgumentTypes(method.methodDescriptor)[i]);
+            notifyPopStack();
+        }
+
+        final Type returnType = Type.getReturnType(method.methodDescriptor);
+
+        emit(new MethodInsnNode(Opcodes.INVOKESTATIC, method.owner, method.name, method.methodDescriptor));
 
         notifyPushStack(returnType);
     }
@@ -1020,7 +1050,7 @@ public class Compiler {
         }
     }
 
-    public void callObject(String magicMethodName, Type objectType, Class<?>[] args) throws ClassNotFoundException, NoSuchMethodException {
+    public void callObject(String magicMethodName, Type objectType, Class<?>... args) throws ClassNotFoundException, NoSuchMethodException {
         final Method method = Class.forName(objectType.getInternalName().replace("/", "."), true, runner).getMethod(MAGIC_PREFIX + magicMethodName, args);
 
         final Type returnType = Type.getType(method.getReturnType());
@@ -1032,9 +1062,53 @@ public class Compiler {
         notifyReplaceLastStack(returnType);
     }
 
+    public void qDot(boolean canAssign) {
+        consume(TokenType.TOKEN_IDENTIFIER, "Expect property name after \".\"");
+        final String afterDot = parser.getPrevious().content();
+
+        LabelNode l2 = new LabelNode();
+        LabelNode l3 = new LabelNode();
+
+        emit(new InsnNode(Opcodes.DUP));
+        emit(new JumpInsnNode(Opcodes.IFNULL, l2));
+
+        if (!match(TokenType.TOKEN_LEFT_PAREN)) {
+            if (peekLastStack() instanceof ClassType type)
+                emit(new FieldInsnNode(Opcodes.GETSTATIC, type.getInternalName(), afterDot, notifyPopStack().getDescriptor()));
+            else try {
+                final Type fieldType = findFieldType(peekLastStack(), afterDot);
+
+                emit(new FieldInsnNode(Opcodes.GETFIELD, notifyPopStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+                notifyPushStack(fieldType);
+                convertLastStackToObject();
+            } catch (ClassNotFoundException | NoSuchFieldException e) {
+                error("Couldn't find field!");
+            }
+
+            emit(new JumpInsnNode(Opcodes.GOTO, l3));
+            emit(l2, new InsnNode(Opcodes.POP),
+                    new InsnNode(Opcodes.ACONST_NULL));
+            emit(l3);
+
+            return;
+        }
+
+        if (peekLastStack() instanceof ClassType)
+            notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopStack().getInternalName(), afterDot));
+        else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot));
+
+        call(false);
+        convertLastStackToObject();
+
+        emit(new JumpInsnNode(Opcodes.GOTO, l3));
+        emit(l2, new InsnNode(Opcodes.POP),
+                new InsnNode(Opcodes.ACONST_NULL));
+        emit(l3);
+    }
+
     public void dot(boolean canAssign) {
         consume(TokenType.TOKEN_IDENTIFIER, "Expect property name after \".\"");
-        String afterDot = parser.getPrevious().content();
+        final String afterDot = parser.getPrevious().content();
 
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
@@ -1046,9 +1120,16 @@ public class Compiler {
             notifyPopStack();
         } else {
             if (!check(TokenType.TOKEN_LEFT_PAREN)) {
-                if (peekLastStack() instanceof ClassType)
-                    emit(new FieldInsnNode(Opcodes.GETSTATIC, notifyPopStack().getInternalName(), afterDot, notifyPopStack().getDescriptor()));
-                else emit(new FieldInsnNode(Opcodes.GETFIELD, notifyPopStack().getInternalName(), afterDot, notifyPopStack().getDescriptor()));
+                if (peekLastStack() instanceof ClassType type)
+                    emit(new FieldInsnNode(Opcodes.GETSTATIC, type.getInternalName(), afterDot, notifyPopStack().getDescriptor()));
+                else try {
+                    final Type fieldType = findFieldType(peekLastStack(), afterDot);
+
+                    emit(new FieldInsnNode(Opcodes.GETFIELD, notifyPopStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+                    notifyPushStack(fieldType);
+                } catch (ClassNotFoundException | NoSuchFieldException e) {
+                    error("Couldn't find field!");
+                }
 
                 return;
             }
@@ -1059,15 +1140,40 @@ public class Compiler {
         }
     }
 
+    public Type findFieldType(Type parentType, String name) throws ClassNotFoundException, NoSuchFieldException {
+        if (parentType.getInternalName().equals(getCurrentClass().name))
+            return Type.getType(getCurrentClass().fields.stream().filter(x -> Objects.equals(x.name, name)).findAny().orElseThrow(NoSuchFieldException::new).desc);
+
+        final Field field = Class.forName(parentType.getInternalName().replace("/", "."), true, runner).getField(name);
+
+        return Type.getType(field.getType());
+    }
+
     public void variable(boolean canAssign) {
         final String identifier = parser.getPrevious().content();
 
-        Local local = null;
+        Local local;
         if (type == CompilerType.METHOD || type == CompilerType.NESTED_METHOD)
             local = locals.get(identifier);
+        else local = null;
 
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
+
+            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            Collections.reverse(clone);
+
+            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            if (oInlineField.isPresent()) {
+                final InlineField inlineField = oInlineField.get();
+                convertLastStackForType(inlineField.type);
+
+                emit(new FieldInsnNode(Opcodes.PUTSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+
+                notifyPopStack();
+
+                return;
+            }
 
             if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
@@ -1076,32 +1182,122 @@ public class Compiler {
 
             emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_PLUS_EQUAL)) {
-            expression();
+            final AbstractInsnNode[] nodes = captureInstructions(compiler -> {
+                compiler.expression();
+
+                return null;
+            }).k;
+
+            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            Collections.reverse(clone);
+
+            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            if (oInlineField.isPresent()) {
+                final InlineField inlineField = oInlineField.get();
+                emit(nodes);
+                convertLastStackForType(inlineField.type);
+
+                emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+                emit(new InsnNode(inlineField.type.getOpcode(Opcodes.IADD)));
+
+                emit(new FieldInsnNode(Opcodes.PUTSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+
+                notifyPopStack();
+
+                return;
+            }
 
             if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
                 return;
             }
 
-            emit(new VarInsnNode(peekLastStack().getOpcode(Opcodes.ILOAD), local.index));
-            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IADD)));
+            if (local.type.equals(StackTypes.INT)) {
+                emit(new IincInsnNode(local.index, Integer.parseInt(parser.getPrevious().content())));
+                notifyPopStack();
 
-            emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+                return;
+            }
+
+            convertLastStackForType(local.type);
+
+            notifyPopStack();
+
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
+            emit(nodes);
+            emit(new InsnNode(local.type.getOpcode(Opcodes.IADD)));
+
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_MINUS_EQUAL)) {
-            expression();
+            final AbstractInsnNode[] nodes = captureInstructions(compiler -> {
+                compiler.expression();
+                compiler.convertLastStackForType(local.type);
+
+                return null;
+            }).k;
+
+            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            Collections.reverse(clone);
+
+            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            if (oInlineField.isPresent()) {
+                final InlineField inlineField = oInlineField.get();
+                emit(nodes);
+                convertLastStackForType(inlineField.type);
+                emit(new InsnNode(inlineField.type.getOpcode(Opcodes.INEG)));
+
+                emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+                emit(new InsnNode(inlineField.type.getOpcode(Opcodes.IADD)));
+
+                emit(new FieldInsnNode(Opcodes.PUTSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+
+                notifyPopStack();
+
+                return;
+            }
 
             if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
                 return;
             }
 
-            emit(new VarInsnNode(peekLastStack().getOpcode(Opcodes.ILOAD), local.index));
-            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.INEG)));
-            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IADD)));
+            if (local.type.equals(StackTypes.INT)) {
+                emit(new IincInsnNode(local.index, -Integer.parseInt(parser.getPrevious().content())));
+                notifyPopStack();
 
-            emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+                return;
+            }
+
+            convertLastStackForType(local.type);
+
+            notifyPopStack();
+
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
+            emit(nodes);
+            emit(new InsnNode(local.type.getOpcode(Opcodes.INEG)));
+            emit(new InsnNode(local.type.getOpcode(Opcodes.IADD)));
+
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_STAR_EQUAL)) {
             expression();
+
+            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            Collections.reverse(clone);
+
+            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            if (oInlineField.isPresent()) {
+                final InlineField inlineField = oInlineField.get();
+                convertLastStackForType(inlineField.type);
+
+                emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+                emit(new InsnNode(inlineField.type.getOpcode(Opcodes.IMUL)));
+
+                emit(new FieldInsnNode(Opcodes.PUTSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+
+                notifyPopStack();
+
+                return;
+            }
 
             if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
@@ -1115,6 +1311,25 @@ public class Compiler {
         } else if (canAssign && match(TokenType.TOKEN_SLASH_EQUAL)) {
             expression();
 
+
+            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            Collections.reverse(clone);
+
+            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            if (oInlineField.isPresent()) {
+                final InlineField inlineField = oInlineField.get();
+                convertLastStackForType(inlineField.type);
+
+                emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+                emit(new InsnNode(inlineField.type.getOpcode(Opcodes.IDIV)));
+
+                emit(new FieldInsnNode(Opcodes.PUTSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+
+                notifyPopStack();
+
+                return;
+            }
+
             if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
                 return;
@@ -1126,11 +1341,18 @@ public class Compiler {
             emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
         } else {
             if (check(TokenType.TOKEN_LEFT_PAREN) && local == null) {
-                notifyPushCallStack(new MethodCall(
-                        -1,
-                        getCurrentClass().name,
-                        Objects.requireNonNullElse(methodNameReplacements.get(identifier), identifier)
-                ));
+                if (inlineMethods.stream().noneMatch(x -> x.name.equals(identifier))) {
+                    notifyPushCallStack(new MethodCall(
+                            -1,
+                            getCurrentClass().name,
+                            Objects.requireNonNullElse(methodNameReplacements.get(identifier), identifier)
+                    ));
+
+                    return;
+                }
+
+                match(TokenType.TOKEN_LEFT_PAREN);
+                callInlineMethod(identifier);
 
                 return;
             }
@@ -1148,6 +1370,17 @@ public class Compiler {
 
                 notifyPushStack(ClassType.of(repClass));
             } else if (getCurrentClass().methods.stream().noneMatch(m -> identifier.equals(m.name))) {
+                final List<InlineField> clone = new ArrayList<>(inlineFields);
+                Collections.reverse(clone);
+
+                Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+                if (oInlineField.isPresent()) {
+                    final InlineField inlineField = oInlineField.get();
+                    emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+                    notifyPushStack(inlineField.type);
+                    return;
+                }
+
                 boolean isField = getCurrentClass().fields.stream()
                         .anyMatch(x -> Objects.equals(x.name, identifier)) && !locals.containsKey(identifier);
 
@@ -1226,9 +1459,24 @@ public class Compiler {
         try {
             clazz = Class.forName(type, true, runner);
         } catch (ClassNotFoundException e) {
-            e.printStackTrace();
             error("\"" + type + "\" is not a valid class!");
             return;
+        }
+
+        for (Method method : clazz.getMethods()) {
+            if (!Modifier.isStatic(method.getModifiers()))
+                continue;
+            if (method.getAnnotation(Inline.class) == null)
+                continue;
+            inlineMethods.add(new InlineMethod(type.replace(".", "/"), method.getName(), Type.getMethodDescriptor(method)));
+        }
+
+        for (Field field : clazz.getFields()) {
+            if (!Modifier.isStatic(field.getModifiers()))
+                continue;
+            if (field.getAnnotation(Inline.class) == null)
+                continue;
+            inlineFields.add(new InlineField(type.replace(".", "/"), field.getName(), Type.getType(field.getType())));
         }
 
         classNameReplacements.put(clazz.getSimpleName(), type.replace(".", "/"));
@@ -1288,20 +1536,13 @@ public class Compiler {
             annotations.add(node);
         } while (match(TokenType.TOKEN_AT));
 
-        switch (parser.getCurrent().type()) {
-            case TOKEN_FN, TOKEN_CLASS -> annotationsForNextElement.addAll(annotations);
-            case TOKEN_LET -> {
-                if (this.type == CompilerType.CLASS || this.type == CompilerType.NESTED_CLASS)
-                    annotationsForNextElement.addAll(annotations);
-            }
-            default -> errorAtCurrent("You can not append annotations to this element!");
-        }
+        annotationsForNextElement.addAll(annotations);
     }
 
     public void modifier() {
         final Set<TokenType> modifiers = new HashSet<>();
 
-        while (match(TokenType.TOKEN_PUBLIC, TokenType.TOKEN_PRIVATE, TokenType.TOKEN_STATIC,
+        while (match(TokenType.TOKEN_INLINE, TokenType.TOKEN_PRIVATE, TokenType.TOKEN_STATIC,
                 TokenType.TOKEN_FINAL, TokenType.TOKEN_MAGIC)) {
             modifiers.add(parser.getPrevious().type());
         }
@@ -1311,6 +1552,11 @@ public class Compiler {
             case TOKEN_CLASS -> {
                 if (modifiers.contains(TokenType.TOKEN_MAGIC)) {
                     error("A class can not be magic!");
+
+                    return;
+                }
+                if (modifiers.contains(TokenType.TOKEN_INLINE)) {
+                    error("A class can not be inline!");
 
                     return;
                 }
@@ -1335,7 +1581,10 @@ public class Compiler {
         final String content = parser.getPrevious().content();
 
         consume(TokenType.TOKEN_LEFT_PAREN, "Expected \"(\" after \"" + content + "\"!");
-        final List<Type> args = argumentList();
+        final Pair<AbstractInsnNode[], Object> insns = captureInstructions(Compiler::argumentList);
+
+        @SuppressWarnings("unchecked")
+        final List<Type> args = (List<Type>) insns.v;
 
         switch (content) {
             case "new" -> {
@@ -1344,6 +1593,10 @@ public class Compiler {
                     return;
                 }
                 emit(new TypeInsnNode(Opcodes.NEW, internalName), new InsnNode(Opcodes.DUP));
+                emit(insns.k);
+                for (Type ignored : args)
+                    notifyPopStack();
+
                 emit(new MethodInsnNode(Opcodes.INVOKESPECIAL,
                         internalName, "<init>", Type.getMethodDescriptor(Type.VOID_TYPE, args.toArray(Type[]::new))));
                 notifyReplaceLastStack(Type.getType(lastStack.getDescriptor()));
@@ -1451,11 +1704,47 @@ public class Compiler {
             convertLastStackToInteger();
         } else if (StackTypes.isTypeStackDouble(type)) {
             convertLastStackToDouble();
-        } else if (StackTypes.isTypeStackBoolean(type)) {
+        } else if (StackTypes.isTypeStackFloat(type)) {
+            convertLastStackToFloat();
+        }  else if (StackTypes.isTypeStackBoolean(type)) {
             convertLastStackToBoolean();
         } else if (StackTypes.isTypeStackLong(type)) {
             convertLastStackToLong();
         }
+    }
+
+    public void convertLastStackToFloat() {
+        Type lastStack = requireLastStack();
+        if (StackTypes.isTypeStackFloat(lastStack))
+            return;
+        if (StackTypes.isTypeStackDouble(lastStack)) {
+            emit(new InsnNode(Opcodes.D2F));
+            notifyReplaceLastStack(StackTypes.FLOAT);
+            return;
+        }
+        if (StackTypes.isTypeStackLong(lastStack)) {
+            emit(new InsnNode(Opcodes.L2F));
+            notifyReplaceLastStack(StackTypes.FLOAT);
+            return;
+        }
+        if (StackTypes.isTypeStackInt(lastStack)) {
+            emit(new InsnNode(Opcodes.I2F));
+            notifyReplaceLastStack(StackTypes.FLOAT);
+            return;
+        }
+        if (StackTypes.isTypeStackString(lastStack)) {
+            emit(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    "java/lang/Float", "parseFloat", "(Ljava/lang/String;)F"));
+            notifyReplaceLastStack(StackTypes.FLOAT);
+            return;
+        }
+        if (StackTypes.isTypeStackObject(lastStack)) {
+            emit(new TypeInsnNode(Opcodes.CHECKCAST, "java/lang/Float"));
+            emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/Float", "floatValue", "()F"));
+            notifyReplaceLastStack(StackTypes.FLOAT);
+            return;
+        }
+        error("Cannot convert " + lastStack + " into a double");
     }
 
     public void convertLastStackToLong() {
@@ -1653,7 +1942,7 @@ public class Compiler {
         try {
             return typeStack.pop();
         } catch (EmptyStackException e) {
-            errorAtCurrent("Lost track of stack?");
+            error("Lost track of stack?");
             e.printStackTrace();
         }
 
@@ -1813,6 +2102,11 @@ public class Compiler {
             else name = parser.getPrevious().content();
         }
 
+        if (modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
+            annotationsForNextElement.add(INLINE_ANNOTATION);
+            modifiersForNextElement.add(TokenType.TOKEN_STATIC);
+        }
+
         boolean constructor = name.equals("<init>");
         consume(TokenType.TOKEN_LEFT_PAREN, "Expected \"(\" after function name!");
 
@@ -1846,19 +2140,27 @@ public class Compiler {
 
         consume(TokenType.TOKEN_RIGHT_PAREN, "Expected \")\" after parameters!");
 
-        final Type type;
-        if (constructor)
-            type = StackTypes.VOID;
-        else type = Type.getType(consumeType("Expected return type after \":\"!"));
+        Type type = StackTypes.VOID;
+        if (!constructor && check(TokenType.TOKEN_COLON))
+            type = Type.getType(consumeType("Expected return type after \":\"!"));
 
         MethodNode methodNode = compiler.getCurrentMethod(true);
 
         methodNode.name = name;
         methodNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
+        if (!Modifier.isPrivate(methodNode.access))
+            methodNode.access |= Opcodes.ACC_PUBLIC;
         methodNode.desc = Type.getMethodDescriptor(type, parameters.toArray(Type[]::new));
-        if (constructor && methodNode.desc.equals("()V")) {
-            methodNode = getCurrentClass().methods.get(0);
-            methodNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
+        if (constructor) {
+            if (methodNode.desc.equals("()V")) {
+                methodNode = getCurrentClass().methods.get(0);
+                methodNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
+                if (!Modifier.isPrivate(methodNode.access))
+                    methodNode.access |= Opcodes.ACC_PUBLIC;
+            } else {
+                getCurrentClass().methods.set(0, methodNode);
+            }
+
             compiler.currentMethod = 0;
         }
 
@@ -1867,7 +2169,7 @@ public class Compiler {
         methodNode.visibleAnnotations = new ArrayList<>(annotationsForNextElement);
         annotationsForNextElement.clear();
 
-        if (!constructor && !methodNode.desc.equals("()V"))
+        if (!(constructor && methodNode.desc.equals("()V")))
             addMethodToCurrentClass(methodNode);
 
         if (constructor && !methodNode.desc.equals("()V"))
@@ -1945,6 +2247,8 @@ public class Compiler {
 
         methodNode.name = jvmName;
         methodNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
+        if (!Modifier.isPrivate(methodNode.access))
+            methodNode.access |= Opcodes.ACC_PUBLIC;
         methodNode.desc = Type.getMethodDescriptor(type, locals.toArray(Type[]::new));
 
         methodNode.visibleAnnotations = new ArrayList<>(annotationsForNextElement);
@@ -1989,7 +2293,7 @@ public class Compiler {
         if (type == CompilerType.METHOD || type == CompilerType.NESTED_METHOD)
             emit(start);
 
-        boolean isFieldStatic = !modifiersForNextElement.isEmpty() && modifiersForNextElement.contains(TokenType.TOKEN_STATIC);
+        boolean isFieldStatic = !modifiersForNextElement.isEmpty() && (modifiersForNextElement.contains(TokenType.TOKEN_STATIC) || modifiersForNextElement.contains(TokenType.TOKEN_INLINE));
 
         int oldCurrentMethod = currentMethod;
         if (type == CompilerType.CLASS || type == CompilerType.NESTED_CLASS) {
@@ -2034,7 +2338,13 @@ public class Compiler {
         }
 
         if (this.type == CompilerType.CLASS || this.type == CompilerType.NESTED_CLASS) {
+            if (modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
+                annotationsForNextElement.add(INLINE_ANNOTATION);
+                modifiersForNextElement.add(TokenType.TOKEN_STATIC);
+            }
             FieldNode fieldNode = new FieldNode(modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0), name, type.getDescriptor(), null, null);
+            if (!modifiersForNextElement.contains(TokenType.TOKEN_PRIVATE))
+                fieldNode.access |= Opcodes.ACC_PUBLIC;
             fieldNode.visibleAnnotations = new ArrayList<>(annotationsForNextElement);
             annotationsForNextElement.clear();
 
@@ -2045,9 +2355,13 @@ public class Compiler {
                 else
                     emit(new FieldInsnNode(Opcodes.PUTFIELD, getCurrentClass().name, name, type.getDescriptor()));
 
-                notifyPopStack();
-                notifyPopStack();
+                if (!modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
+                    notifyPopStack();
+                    notifyPopStack();
+                }
             }
+
+            modifiersForNextElement.clear();
         } else if (this.type == CompilerType.METHOD || this.type == CompilerType.NESTED_METHOD) {
             if (!modifiersForNextElement.isEmpty()) {
                 errorAtCurrent("A variable can not have modifiers!");
@@ -2091,14 +2405,15 @@ public class Compiler {
         }
 
         if (match(TokenType.TOKEN_SEMICOLON)) {
-            emit(new InsnNode(Opcodes.RETURN));
+            emitVoidReturn();
             return;
         }
 
         expression();
 
         final Type returnType = Type.getReturnType(getCurrentMethod(true).desc);
-        convertLastStackForType(returnType);
+        if (!returnType.equals(StackTypes.STRING_TYPE))
+            convertLastStackForType(returnType);
 
         emit(new InsnNode(returnType.getOpcode(Opcodes.IRETURN)));
 
@@ -2153,7 +2468,17 @@ public class Compiler {
             typeStack.addAll(compiler.typeStack);
     }
 
+    public void foreachStatement() {
+        varDeclaration(false);
+    }
+
     public void forStatement() {
+        if (match(TokenType.TOKEN_LESS)) {
+            foreachStatement();
+
+            return;
+        }
+
         if (match(TokenType.TOKEN_LET))
             varDeclaration(true);
         else consume(TokenType.TOKEN_SEMICOLON, "Expected \";\"");
@@ -2226,15 +2551,19 @@ public class Compiler {
 
         ClassNode classNode = new ClassNode();
 
-        if (match(TokenType.TOKEN_COLON))
+        boolean definedSuperclass = match(TokenType.TOKEN_COLON);
+        if (definedSuperclass)
             classNode.superName = parseType("Expect superclass name");
 
         consume(TokenType.TOKEN_LEFT_BRACE, "Expected \"{\" before class body");
 
         classNode.version = Opcodes.V1_8;
         classNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
+        if (!Modifier.isPrivate(classNode.access))
+            classNode.access |= Opcodes.ACC_PUBLIC;
         classNode.name = (filePackage.replace(".", "/") + "/%s").formatted(className);
-        classNode.superName = "java/lang/Object";
+        if (!definedSuperclass)
+            classNode.superName = "java/lang/Object";
 
         if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC)) {
             error("Classes can not be magic!");
@@ -2291,6 +2620,8 @@ public class Compiler {
 
         classNode.version = Opcodes.V1_8;
         classNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
+        if (!Modifier.isPrivate(classNode.access))
+            classNode.access |= Opcodes.ACC_PUBLIC;
         classNode.name = (filePackage.replace(".", "/") + "/%s").formatted(className);
         classNode.superName = "java/lang/Object";
 
@@ -2444,7 +2775,7 @@ public class Compiler {
     }
 
     public static void compileAndRun(String source, String... arguments) throws InvocationTargetException {
-        EphemeralRunner runner = new EphemeralRunner();
+        EphemeralRunner runner = new EphemeralRunner(Thread.currentThread().getContextClassLoader());
 
         new Compiler("zip.sodium.generated", "Main", runner).compileToEphemeralRunner(source);
 

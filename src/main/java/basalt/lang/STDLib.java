@@ -3,32 +3,41 @@ package basalt.lang;
 import java.lang.reflect.Array;
 
 public class STDLib {
+    @Inline
     public static void println(String s) {
         System.out.println(s);
     }
 
+    @Inline
     public static void assertThat(boolean condition) {
         if (!condition)
             throw new AssertionError();
     }
 
+    @Inline
     public static void exit() {
         exit(0);
     }
 
+    @Inline
     public static void exit(int code) {
         System.exit(code);
     }
 
+    @Inline
     public static void assertThat(boolean condition, String message) {
         if (!condition)
             throw new AssertionError(message);
     }
 
+    @Inline
     public static String toString(Object a) {
+        if (a == null)
+            return "null";
         return a.toString();
     }
 
+    @Inline
     public static String arrayToString(Object a) {
         if (a == null)
             return "null";

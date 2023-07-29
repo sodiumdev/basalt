@@ -38,7 +38,6 @@ import java.lang.reflect.Method;
  * @author Chris Nokleberg
  */
 public class Type {
-
   /** The sort of the {@code void} type. See {@link #getSort}. */
   public static final int VOID = 0;
 
@@ -145,6 +144,8 @@ public class Type {
    * and a field or method descriptor in the other cases.
    */
   public final int valueEnd;
+
+  public final boolean nullable = false;
 
   /**
    * Constructs a reference type.

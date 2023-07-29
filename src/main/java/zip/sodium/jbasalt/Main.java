@@ -11,12 +11,18 @@ import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.commons.InstructionAdapter;
 import org.objectweb.asm.tree.InnerClassNode;
+import org.zeroturnaround.zip.ZipUtil;
 import zip.sodium.jbasalt.compiler.Compiler;
 import zip.sodium.jbasalt.compiler.EphemeralRunner;
 
-import java.io.*;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.net.URISyntaxException;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Objects;
 
 public class Main {
     private static void deleteContentsOfFolder(File folder) {
@@ -36,23 +42,33 @@ public class Main {
     private static final File outDir;
     public static final File inDir;
 
+    public static final File jarDir;
+
     private static final Collection<File> files;
 
     static {
         deleteContentsOfFolder(new File("build/classes/basalt/"));
+        deleteContentsOfFolder(new File("build/libs/"));
 
         outDir = new File("build/classes/basalt/main/");
         inDir = new File("src/main/basalt/");
 
+        jarDir = new File("build/libs/Basalt.jar");
+
         outDir.mkdirs();
         inDir.mkdirs();
+
+        try {
+            jarDir.createNewFile();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
 
         files = FileUtils.listFiles(
                 inDir,
                 new RegexFileFilter("^(.*?)\\.bas$"),
                 DirectoryFileFilter.DIRECTORY
         );
-        System.out.println(files);
     }
 
     private static void compileFile(EphemeralRunner runner, File f) throws IOException {
@@ -99,15 +115,25 @@ public class Main {
         }
     }
 
-    public static void main(String[] args) throws IOException, ReflectiveOperationException {
-        if (args.length == 0) {
-            System.err.println("Please specify the main class in the first argument");
-
-            System.exit(-1);
-            return;
+    private static void addResourcesToJar(File dir) {
+        for (File f : Objects.requireNonNull(dir.listFiles())) {
+            if (f.isDirectory())
+                addResourcesToJar(dir);
+            else ZipUtil.addEntry(jarDir, StringUtils.replaceOnce(f.getPath(), "build\\resources\\main\\", ""), f);
         }
+    }
 
-        final EphemeralRunner runner = new EphemeralRunner();
+    private static void jarFile() {
+        ZipUtil.pack(outDir, jarDir);
+        final File resources = new File("build/resources/main/");
+        resources.mkdirs();
+
+        addResourcesToJar(resources);
+        ZipUtil.addEntry(jarDir, "META-INF/MANIFEST.MF", new File("build/tmp/jar/MANIFEST.MF"));
+    }
+
+    public static void main(String[] args) throws IOException, ReflectiveOperationException, URISyntaxException {
+        final EphemeralRunner runner = new EphemeralRunner(Thread.currentThread().getContextClassLoader());
         runner.setCompileFunction(Main::compileFile);
 
         Thread.currentThread().setContextClassLoader(runner);
@@ -115,6 +141,9 @@ public class Main {
         for (File f : files)
             compileFile(runner, f);
 
-        runner.run(args[0], Arrays.copyOfRange(args, 1, args.length));
+        // jarFile();
+
+        if (args.length >= 1)
+            runner.run(args[0], Arrays.copyOfRange(args, 1, args.length));
     }
 }

@@ -7,9 +7,6 @@ import org.objectweb.asm.commons.InstructionAdapter;
 import java.util.Map;
 
 public final class StackTypes {
-    public static final Type OBJECT_ARRAY = Type.getType(Object[].class);
-    public static final Type MAP_TYPE = Type.getType(Map.class);
-
     private StackTypes() {
         throw new AssertionError("Cannot instantiate StackTypes!");
     }
@@ -76,15 +73,15 @@ public final class StackTypes {
     }
 
     public static boolean isTypeStackInt(Type type) {
-        return type == BOOLEAN || type == CHAR || type == BYTE || type == SHORT || type == INT;
+        return type.equals(INT);
     }
 
     public static boolean isTypeStackDouble(Type type) {
-        return type == DOUBLE;
+        return type.equals(DOUBLE);
     }
 
     public static boolean isTypeStackFloat(Type type) {
-        return type == FLOAT;
+        return type.equals(FLOAT);
     }
 
     public static boolean isTypeStackLong(Type type) {
