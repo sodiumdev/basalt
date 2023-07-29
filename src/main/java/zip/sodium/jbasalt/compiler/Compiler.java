@@ -141,9 +141,9 @@ public class Compiler {
         rules.put(TokenType.TOKEN_BANG, new ParseRule(Compiler::unary, null, Precedence.PREC_NONE));
         rules.put(TokenType.TOKEN_BANG_EQUAL, new ParseRule(null, Compiler::binary, Precedence.PREC_EQUALITY));
         rules.put(TokenType.TOKEN_EQUAL_EQUAL, new ParseRule(null, Compiler::binary, Precedence.PREC_EQUALITY));
-        rules.put(TokenType.TOKEN_GREATER, new ParseRule(null, Compiler::binary, Precedence.PREC_COMPARISON));
+        rules.put(TokenType.TOKEN_GREATER, new ParseRule(Compiler::cast, Compiler::binary, Precedence.PREC_COMPARISON));
         rules.put(TokenType.TOKEN_GREATER_EQUAL, new ParseRule(null, Compiler::binary, Precedence.PREC_COMPARISON));
-        rules.put(TokenType.TOKEN_LESS, new ParseRule(Compiler::cast, Compiler::binary, Precedence.PREC_COMPARISON));
+        rules.put(TokenType.TOKEN_LESS, new ParseRule(null, Compiler::binary, Precedence.PREC_COMPARISON));
         rules.put(TokenType.TOKEN_LESS_EQUAL, new ParseRule(null, Compiler::binary, Precedence.PREC_COMPARISON));
 
         rules.put(TokenType.TOKEN_IDENTIFIER, new ParseRule(Compiler::variable, null, Precedence.PREC_NONE));
@@ -408,12 +408,12 @@ public class Compiler {
         parsePrecedence(Precedence.PREC_ASSIGNMENT);
     }
 
-    public void expressionStatement(boolean semicolon) {
+    public void expressionStatement(boolean clearStack, boolean semicolon) {
         expression();
         if (semicolon)
             consume(TokenType.TOKEN_SEMICOLON, "Expect \";\"");
         else match(TokenType.TOKEN_SEMICOLON);
-        clearStack();
+        if (clearStack) clearStack();
     }
 
     public void parsePrecedence(Precedence precedence) {
@@ -447,17 +447,31 @@ public class Compiler {
 
     public void cast(boolean canAssign) {
         final Type type = Type.getType(parseType("Expected type name"));
+        final boolean nullable = match(TokenType.TOKEN_QMARK);
 
-        consume(TokenType.TOKEN_GREATER, "Expected \">\" after type name");
+        consume(TokenType.TOKEN_LESS, "Expected \">\" after type name");
 
         expression();
 
         final String typeName;
-        if (type.getSort() == Type.OBJECT) {
+        if (type.getSort() != Type.OBJECT) {
             convertLastStackForType(type);
 
             return;
         } else typeName = type.getInternalName();
+
+        LabelNode end = new LabelNode();
+
+        if (nullable) {
+            emit(new InsnNode(Opcodes.DUP));
+            emit(new JumpInsnNode(Opcodes.IFNONNULL, end));
+
+            emit(new InsnNode(Opcodes.POP));
+            emitNull();
+
+            emit(end);
+            notifyPopStack();
+        }
 
         emit(new TypeInsnNode(Opcodes.CHECKCAST, typeName));
         notifyReplaceLastStack(type);
@@ -1090,6 +1104,11 @@ public class Compiler {
     }
 
     public void qDot(boolean canAssign) {
+        if (!peekLastStack().nullable) {
+            dot(canAssign);
+            return;
+        }
+
         consume(TokenType.TOKEN_IDENTIFIER, "Expect property name after \".\"");
         final String afterDot = parser.getPrevious().content();
 
@@ -1562,7 +1581,7 @@ public class Compiler {
         emit(start);
 
         emit(new InsnNode(Opcodes.POP));
-        expression();
+        statement(false);
 
         emit(end);
 
@@ -2531,7 +2550,7 @@ public class Compiler {
         consume(TokenType.TOKEN_SEMICOLON, "Expected \";\" after return statement");
     }
 
-    public void statement() {
+    public void statement(boolean clearStack) {
         if (match(TokenType.TOKEN_RETURN))
             returnStatement();
         else if (match(TokenType.TOKEN_LEFT_BRACE))
@@ -2543,7 +2562,11 @@ public class Compiler {
         else if (match(TokenType.TOKEN_FOR))
             forStatement();
         else
-            expressionStatement(false);
+            expressionStatement(clearStack, false);
+    }
+
+    public void statement() {
+        statement(true);
     }
 
     private Pair<AbstractInsnNode[], Object> captureInstructions(Function<Compiler, Object> consumer) {
