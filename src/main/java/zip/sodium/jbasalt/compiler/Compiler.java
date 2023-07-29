@@ -1231,7 +1231,6 @@ public class Compiler {
         } else if (canAssign && match(TokenType.TOKEN_MINUS_EQUAL)) {
             final AbstractInsnNode[] nodes = captureInstructions(compiler -> {
                 compiler.expression();
-                compiler.convertLastStackForType(local.type);
 
                 return null;
             }).k;
@@ -1659,11 +1658,6 @@ public class Compiler {
         emit(label5);
 
         notifyPushStack(StackTypes.BOOLEAN);
-    }
-
-    public void emitNullReturn() {
-        emitNull();
-        emit(new InsnNode(Opcodes.ARETURN));
     }
 
     private void emitVoidReturn() {
