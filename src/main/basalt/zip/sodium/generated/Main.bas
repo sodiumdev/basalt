@@ -1,8 +1,11 @@
-import java.lang.String
+import basalt.lang.STDLib
 
-import zip.sodium.generated.Library
+import java.lang.String
 
 class Main {
     static fn main(args: String[]) {
+        let asd: String? = null
+
+        println(asd ?: "hi")
     }
 }

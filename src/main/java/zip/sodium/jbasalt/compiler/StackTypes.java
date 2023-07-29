@@ -21,12 +21,17 @@ public final class StackTypes {
     public static final Type LONG = Type.LONG_TYPE;
     public static final Type DOUBLE = Type.DOUBLE_TYPE;
     public static final Type OBJECT_TYPE = InstructionAdapter.OBJECT_TYPE;
+    public static final Type NULLABLE_OBJECT_TYPE = Type.getType("Ljava/lang/Object;");
     public static final Type STRING_TYPE = Type.getType(String.class);
     public static final Type CLASS_TYPE = Type.getType(Class.class);
     public static final Type INTEGER_TYPE = Type.getType(Integer.class);
     public static final Type DOUBLE_TYPE = Type.getType(Double.class);
     public static final Type FLOAT_TYPE = Type.getType(Float.class);
     public static final Type LONG_TYPE = Type.getType(Long.class);
+
+    static {
+        NULLABLE_OBJECT_TYPE.nullable = true;
+    }
 
     public static Type getTypeFromClassName(final String className) {
         return switch (className) {

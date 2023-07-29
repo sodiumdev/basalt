@@ -145,7 +145,7 @@ public class Type {
    */
   public final int valueEnd;
 
-  public final boolean nullable = false;
+  public boolean nullable = false;
 
   /**
    * Constructs a reference type.

@@ -84,7 +84,7 @@ public class Scanner {
             case '*' -> makeToken(match('=') ? TokenType.TOKEN_STAR_EQUAL : TokenType.TOKEN_STAR);
             case '/' -> makeToken(match('=') ? TokenType.TOKEN_SLASH_EQUAL : TokenType.TOKEN_SLASH);
             case '@' -> makeToken(TokenType.TOKEN_AT);
-            case '?' -> makeToken(match('.') ? TokenType.TOKEN_QDOT : TokenType.TOKEN_QMARK);
+            case '?' -> makeToken(match('.') ? TokenType.TOKEN_QDOT : (match(':') ? TokenType.TOKEN_ELVIS : TokenType.TOKEN_QMARK));
 
             case '!' -> makeToken(match('=') ? TokenType.TOKEN_BANG_EQUAL : TokenType.TOKEN_BANG);
             case '=' -> makeToken(match('=') ? TokenType.TOKEN_EQUAL_EQUAL : TokenType.TOKEN_EQUAL);

@@ -17,7 +17,7 @@ public enum TokenType {
     TOKEN_EQUAL, TOKEN_EQUAL_EQUAL,
     TOKEN_GREATER, TOKEN_GREATER_EQUAL,
     TOKEN_LESS, TOKEN_LESS_EQUAL,
-    TOKEN_QMARK, TOKEN_QDOT,
+    TOKEN_QMARK, TOKEN_QDOT, TOKEN_ELVIS,
     // Literals.
     TOKEN_IDENTIFIER, TOKEN_STRING, TOKEN_NUMBER,
     // Keywords.
@@ -50,6 +50,6 @@ public enum TokenType {
     public InvalidTokenException makeInvalidTokenException(Compiler compiler, String text) {
         return new InvalidTokenException(
                 text.replace("%s", this.name()) +
-                ": " + compiler.typeStack, this);
+                ": " + compiler.instanceStack, this);
     }
 }

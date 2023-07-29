@@ -10,7 +10,6 @@ import zip.sodium.jbasalt.Parser;
 import zip.sodium.jbasalt.Scanner;
 import zip.sodium.jbasalt.token.Token;
 import zip.sodium.jbasalt.token.TokenType;
-import zip.sodium.jbasalt.type.ClassType;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -24,10 +23,12 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
-
 public class Compiler {
     private static final String MAGIC_PREFIX = "magic^";
+
     private static final AnnotationNode INLINE_ANNOTATION = new AnnotationNode("Lbasalt/lang/Inline;");
+    private static final AnnotationNode NULLABLE_ANNOTATION = new AnnotationNode("Lorg/jetbrains/annotations/Nullable;");
+    private static final AnnotationNode NONNULL_ANNOTATION = new AnnotationNode("Lorg/jetbrains/annotations/NotNull;");
 
     private CompilerType type;
     public Parser parser;
@@ -78,12 +79,19 @@ public class Compiler {
     public record MethodCall(int opcode, String owner, String name) {}
 
     /**
+     * - {@link #peekLastTypeStack()}
+     * - {@link #notifyPushTypeStack(Type)}
+     * - {@link #notifyPopTypeStack()}
+     */
+    public final Stack<Type> typeStack = new Stack<>();
+
+    /**
      * - {@link #clearStack()}
      * - {@link #peekLastStack()}
      * - {@link #notifyPushStack(Type)}
      * - {@link #notifyPopStack()}
      */
-    public final Stack<Type> typeStack = new Stack<>();
+    public final Stack<Type> instanceStack = new Stack<>();
 
     /**
      * - {@link #notifyPushCallStack(MethodCall)}
@@ -120,7 +128,7 @@ public class Compiler {
         rules.put(TokenType.TOKEN_INLINE, ParseRule.NULL);
 
         rules.put(TokenType.TOKEN_QDOT, new ParseRule(null, Compiler::qDot, Precedence.PREC_CALL));
-
+        rules.put(TokenType.TOKEN_ELVIS, new ParseRule(null, Compiler::elvis, Precedence.PREC_CALL));
         rules.put(TokenType.TOKEN_QMARK, new ParseRule(null, Compiler::ternary, Precedence.PREC_CALL));
 
         rules.put(TokenType.TOKEN_LEFT_PAREN, new ParseRule(Compiler::grouping, Compiler::call, Precedence.PREC_CALL));
@@ -331,7 +339,7 @@ public class Compiler {
 
     public void emitNull() {
         emit(new InsnNode(Opcodes.ACONST_NULL));
-        notifyPushStack(StackTypes.OBJECT_TYPE);
+        notifyPushStack(StackTypes.NULLABLE_OBJECT_TYPE);
     }
 
     public void emitSwap() {
@@ -418,10 +426,15 @@ public class Compiler {
 
         boolean canAssign = precedence.ordinal() <= Precedence.PREC_ASSIGNMENT.ordinal();
         prefixRule.accept(this, canAssign);
+        if (parser.hadError())
+            System.exit(-1);
 
         while (precedence.ordinal() <= getRule(parser.getCurrent().type()).precedence().ordinal()) {
             advance();
             getRule(parser.getPrevious().type()).infixRule().accept(this, canAssign);
+
+            if (parser.hadError())
+                System.exit(-1);
         }
 
         if (canAssign && match(TokenType.TOKEN_EQUAL))
@@ -440,7 +453,7 @@ public class Compiler {
         expression();
 
         final String typeName;
-        if (PRIMITIVE_DESCRIPTORS.contains(type.getDescriptor())) {
+        if (type.getSort() == Type.OBJECT) {
             convertLastStackForType(type);
 
             return;
@@ -637,6 +650,8 @@ public class Compiler {
 
     public void array(boolean canAssign) {
         final String arrayType = parseType("Expected array type after \"[\"");
+        boolean nullable = match(TokenType.TOKEN_QMARK);
+
         consume(TokenType.TOKEN_COLON, "Expected \":\" after array type");
 
         Type internalType;
@@ -654,6 +669,11 @@ public class Compiler {
                 do {
                     compiler.emitConstant(index);
                     compiler.expression();
+                    if (!nullable && peekLastStack().nullable) {
+                        error("Nullable value inside of non-nullable array!");
+
+                        return null;
+                    }
 
                     compiler.emit(new InsnNode(finalInternalType.getOpcode(Opcodes.IASTORE)));
                     compiler.emit(new InsnNode(Opcodes.DUP));
@@ -902,7 +922,7 @@ public class Compiler {
             subscriptArray(canAssign);
         else if (isMap)
             subscriptMap(canAssign);
-        else if (!PRIMITIVE_DESCRIPTORS.contains(lastStack.getDescriptor()))
+        else if (lastStack.getSort() == Type.OBJECT)
             try {
                 subscriptObject(canAssign, lastStack);
             } catch (ClassNotFoundException | NoSuchMethodException e) {
@@ -912,7 +932,7 @@ public class Compiler {
 
     public Class<?> typeToClass(Type type) {
         try {
-            if (PRIMITIVE_DESCRIPTORS.contains(type.getDescriptor()))
+            if (type.getSort() != Type.OBJECT)
                 return PRIMITIVE_TYPES.get(type.getSort());
 
             return Class.forName(type.getInternalName().replace("/", "."), true, runner);
@@ -964,24 +984,31 @@ public class Compiler {
 
                 break;
             }
-        else for (Method method : Class.forName(call.owner.replace("/", "."), true, runner).getDeclaredMethods()) {
-            if (!method.getName().equals(call.name) && !methodNameReplacements.containsValue(call.name))
-                continue;
-            if (args.size() != method.getParameterCount())
-                continue;
+        else {
+            Class<?> clazz = Class.forName(call.owner.replace("/", "."), true, runner);
 
-            for (int i = 0; i < args.size(); i++) {
-                convertLastStackForType(Type.getType(method.getParameterTypes()[i]));
-                notifyPopStack();
+            for (Method method : clazz.getDeclaredMethods()){
+                if (!method.getName().equals(call.name) && !methodNameReplacements.containsValue(call.name))
+                    continue;
+                if (args.size() != method.getParameterCount())
+                    continue;
+
+                for (int i = 0; i < args.size(); i++) {
+                    convertLastStackForType(Type.getType(method.getParameterTypes()[i]));
+                    notifyPopStack();
+                }
+
+
+                descriptor = Type.getMethodDescriptor(method);
+                if (opcode == -1) {
+                    if (Modifier.isStatic(method.getModifiers()))
+                        opcode = Opcodes.INVOKESTATIC;
+                    else opcode = clazz.isInterface() ? Opcodes.INVOKEINTERFACE : Opcodes.INVOKEVIRTUAL;
+                } else if (opcode == Opcodes.INVOKEVIRTUAL && clazz.isInterface())
+                    opcode = Opcodes.INVOKEINTERFACE;
+
+                break;
             }
-
-            descriptor = Type.getMethodDescriptor(method);
-            if (opcode == -1)
-                if (Modifier.isStatic(method.getModifiers()))
-                    opcode = Opcodes.INVOKESTATIC;
-                else opcode = Opcodes.INVOKEVIRTUAL;
-
-            break;
         }
 
         if (opcode == -1 || descriptor == null) {
@@ -1035,8 +1062,8 @@ public class Compiler {
         }
 
         final Type lastStack = peekLastStack();
-        if (PRIMITIVE_DESCRIPTORS.contains(lastStack.getDescriptor())) {
-            error("Last stack is a primitive and not an object!");
+        if (lastStack.getSort() != Type.OBJECT) {
+            error("Last stack is not an object!");
 
             return;
         }
@@ -1073,14 +1100,18 @@ public class Compiler {
         emit(new JumpInsnNode(Opcodes.IFNULL, l2));
 
         if (!match(TokenType.TOKEN_LEFT_PAREN)) {
-            if (peekLastStack() instanceof ClassType type)
-                emit(new FieldInsnNode(Opcodes.GETSTATIC, type.getInternalName(), afterDot, notifyPopStack().getDescriptor()));
-            else try {
+            if (peekLastTypeStack() != null) try {
+                final Type fieldType = findFieldType(peekLastTypeStack(), afterDot);
+
+                emit(new FieldInsnNode(Opcodes.GETSTATIC, peekLastTypeStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+                notifyPushStack(fieldType);
+            } catch (ClassNotFoundException | NoSuchFieldException e) {
+                error("Couldn't find field!");
+            } else try {
                 final Type fieldType = findFieldType(peekLastStack(), afterDot);
 
                 emit(new FieldInsnNode(Opcodes.GETFIELD, notifyPopStack().getInternalName(), afterDot, fieldType.getDescriptor()));
                 notifyPushStack(fieldType);
-                convertLastStackToObject();
             } catch (ClassNotFoundException | NoSuchFieldException e) {
                 error("Couldn't find field!");
             }
@@ -1093,8 +1124,8 @@ public class Compiler {
             return;
         }
 
-        if (peekLastStack() instanceof ClassType)
-            notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopStack().getInternalName(), afterDot));
+        if (peekLastTypeStack() != null)
+            notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot));
         else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot));
 
         call(false);
@@ -1112,17 +1143,32 @@ public class Compiler {
 
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
-            if (peekPreviousLastStack() instanceof ClassType)
-                emit(new FieldInsnNode(Opcodes.PUTSTATIC, peekPreviousLastStack().getInternalName(), afterDot, peekLastStack().getDescriptor()));
-            else emit(new FieldInsnNode(Opcodes.PUTFIELD, peekPreviousLastStack().getInternalName(), afterDot, peekLastStack().getDescriptor()));
+            if (peekLastTypeStack() != null) try {
+                final Type fieldType = findFieldType(peekLastTypeStack(), afterDot);
+
+                emit(new FieldInsnNode(Opcodes.PUTSTATIC, peekLastTypeStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+            } catch (ClassNotFoundException | NoSuchFieldException e) {
+                error("Couldn't find field!");
+            } else try {
+                final Type fieldType = findFieldType(peekLastStack(), afterDot);
+
+                emit(new FieldInsnNode(Opcodes.PUTFIELD, notifyPopStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+            } catch (ClassNotFoundException | NoSuchFieldException e) {
+                error("Couldn't find field!");
+            }
 
             notifyPopStack();
             notifyPopStack();
         } else {
             if (!check(TokenType.TOKEN_LEFT_PAREN)) {
-                if (peekLastStack() instanceof ClassType type)
-                    emit(new FieldInsnNode(Opcodes.GETSTATIC, type.getInternalName(), afterDot, notifyPopStack().getDescriptor()));
-                else try {
+                if (peekLastTypeStack() != null) try {
+                    final Type fieldType = findFieldType(peekLastTypeStack(), afterDot);
+
+                    emit(new FieldInsnNode(Opcodes.GETSTATIC, peekLastTypeStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+                    notifyPushStack(fieldType);
+                } catch (ClassNotFoundException | NoSuchFieldException e) {
+                    error("Couldn't find field!");
+                } else try {
                     final Type fieldType = findFieldType(peekLastStack(), afterDot);
 
                     emit(new FieldInsnNode(Opcodes.GETFIELD, notifyPopStack().getInternalName(), afterDot, fieldType.getDescriptor()));
@@ -1134,8 +1180,8 @@ public class Compiler {
                 return;
             }
 
-            if (peekLastStack() instanceof ClassType)
-                notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopStack().getInternalName(), afterDot));
+            if (peekLastTypeStack() != null)
+                notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot));
             else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot));
         }
     }
@@ -1367,7 +1413,7 @@ public class Compiler {
                     return;
                 }
 
-                notifyPushStack(ClassType.of(repClass));
+                notifyPushTypeStack(Type.getType(repClass));
             } else if (getCurrentClass().methods.stream().noneMatch(m -> identifier.equals(m.name))) {
                 final List<InlineField> clone = new ArrayList<>(inlineFields);
                 Collections.reverse(clone);
@@ -1495,10 +1541,27 @@ public class Compiler {
 
         emit(new JumpInsnNode(Opcodes.GOTO, end));
 
-        consume(TokenType.TOKEN_COLON, "colon");
+        consume(TokenType.TOKEN_COLON, "Expected \":\" after expression!");
 
         emit(start);
 
+        expression();
+
+        emit(end);
+
+        notifyPopStack();
+    }
+
+    public void elvis(boolean canAssign) {
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        emit(new InsnNode(Opcodes.DUP));
+        emit(new JumpInsnNode(Opcodes.IFNULL, start));
+
+        emit(new JumpInsnNode(Opcodes.GOTO, end));
+        emit(start);
+
+        emit(new InsnNode(Opcodes.POP));
         expression();
 
         emit(end);
@@ -1572,10 +1635,6 @@ public class Compiler {
     }
 
     public void specialDot(boolean canAssign) {
-        final Type lastStack = peekLastStack();
-
-        final String internalName = peekLastStack().getInternalName();
-
         consume(TokenType.TOKEN_IDENTIFIER, "Expected identifier after \":\"!");
         final String content = parser.getPrevious().content();
 
@@ -1587,10 +1646,14 @@ public class Compiler {
 
         switch (content) {
             case "new" -> {
-                if (!(lastStack instanceof ClassType)) {
-                    errorAtCurrent("Last stack is not a class!");
+                if (peekLastTypeStack() == null) {
+                    error("Last stack is not a class!");
+
                     return;
                 }
+
+                final String internalName = peekLastTypeStack().getInternalName();
+
                 emit(new TypeInsnNode(Opcodes.NEW, internalName), new InsnNode(Opcodes.DUP));
                 emit(insns.k);
                 for (Type ignored : args)
@@ -1598,12 +1661,12 @@ public class Compiler {
 
                 emit(new MethodInsnNode(Opcodes.INVOKESPECIAL,
                         internalName, "<init>", Type.getMethodDescriptor(Type.VOID_TYPE, args.toArray(Type[]::new))));
-                notifyReplaceLastStack(Type.getType(lastStack.getDescriptor()));
+                notifyPushStack(notifyPopTypeStack());
             }
             case "subscript" -> {
                 final Method method;
                 try {
-                    method = Class.forName(lastStack.getInternalName().replace("/", "."), true, runner).getMethod(MAGIC_PREFIX + "SUBSCRIPT", Object.class);
+                    method = Class.forName(peekLastStack().getInternalName().replace("/", "."), true, runner).getMethod(MAGIC_PREFIX + "subscript", Object.class);
                 } catch (NoSuchMethodException | ClassNotFoundException e) {
                     throw new RuntimeException(e);
                 }
@@ -1612,7 +1675,7 @@ public class Compiler {
                 convertLastStackToObject();
 
                 emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
-                        lastStack.getInternalName(), MAGIC_PREFIX + "SUBSCRIPT", Type.getMethodDescriptor(method)));
+                        peekLastStack().getInternalName(), MAGIC_PREFIX + "subscript", Type.getMethodDescriptor(method)));
 
                 notifyPopStack();
                 notifyReplaceLastStack(returnType);
@@ -1620,7 +1683,7 @@ public class Compiler {
             case "call" -> {
                 final Method method;
                 try {
-                    method = Class.forName(lastStack.getInternalName().replace("/", "."), true, runner).getMethod(MAGIC_PREFIX + "SUBSCRIPT", Object.class);
+                    method = Class.forName(peekLastStack().getInternalName().replace("/", "."), true, runner).getMethod(MAGIC_PREFIX + "call", Object.class);
                 } catch (NoSuchMethodException | ClassNotFoundException e) {
                     throw new RuntimeException(e);
                 }
@@ -1629,7 +1692,7 @@ public class Compiler {
                 convertLastStackToObject();
 
                 emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
-                        lastStack.getInternalName(), MAGIC_PREFIX + "CALL", Type.getMethodDescriptor(method)));
+                        peekLastStack().getInternalName(), MAGIC_PREFIX + "call", Type.getMethodDescriptor(method)));
 
                 notifyPopStack();
                 notifyReplaceLastStack(returnType);
@@ -1665,12 +1728,12 @@ public class Compiler {
     }
 
     public Type peekPreviousLastStack() {
-        int size = typeStack.size();
-        return size < 2 ? null : typeStack.get(size - 2);
+        int size = instanceStack.size();
+        return size < 2 ? null : instanceStack.get(size - 2);
     }
 
     public Type peekLastStack() {
-        return typeStack.isEmpty() ? null : typeStack.peek();
+        return instanceStack.isEmpty() ? null : instanceStack.peek();
     }
 
     public Type requireLastStack() {
@@ -1916,8 +1979,7 @@ public class Compiler {
         else if (StackTypes.isTypeStackPureObject(lastStack))
             emit(new MethodInsnNode(Opcodes.INVOKESTATIC, "basalt/lang/STDLib",
                     "toString", "(Ljava/lang/Object;)Ljava/lang/String;"));
-        else
-            emit(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/String",
+        else emit(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/String",
                     "valueOf", "(" + lastStack.getDescriptor() + ")Ljava/lang/String;"));
         notifyReplaceLastStack(StackTypes.STRING_TYPE);
     }
@@ -1929,14 +1991,39 @@ public class Compiler {
 
     public void notifyPushStack(Type type) {
         if (type == StackTypes.VOID) return;
-        typeStack.add(type);
+        instanceStack.add(type);
     }
 
     public Type notifyPopStack() {
         try {
-            return typeStack.pop();
+            return instanceStack.pop();
         } catch (EmptyStackException e) {
             error("Lost track of stack?");
+            e.printStackTrace();
+        }
+
+        return null;
+    }
+
+    public Type peekLastTypeStack() {
+        return typeStack.isEmpty() ? null : typeStack.peek();
+    }
+
+    public void notifyReplaceLastTypeStack(Type type) {
+        notifyPopTypeStack();
+        notifyPushTypeStack(type);
+    }
+
+    public void notifyPushTypeStack(Type type) {
+        if (type == StackTypes.VOID) return;
+        typeStack.add(type);
+    }
+
+    public Type notifyPopTypeStack() {
+        try {
+            return typeStack.pop();
+        } catch (EmptyStackException e) {
+            error("Lost track of type stack?");
             e.printStackTrace();
         }
 
@@ -1998,11 +2085,11 @@ public class Compiler {
     public String parseGenericType() {
         StringBuilder builder = new StringBuilder();
 
-        if (match(TokenType.TOKEN_LESS)) {
+        if (match(TokenType.TOKEN_GREATER)) {
             builder.append("<");
 
             List<String> types = new ArrayList<>();
-            if (!check(TokenType.TOKEN_GREATER)) {
+            if (!check(TokenType.TOKEN_LESS)) {
                 do {
                     types.add(parseType("Invalid type!"));
                 } while (match(TokenType.TOKEN_COMMA));
@@ -2010,7 +2097,7 @@ public class Compiler {
 
             builder.append(String.join("", types)).append(">");
 
-            consume(TokenType.TOKEN_GREATER, "Expected \">\" after generics!");
+            consume(TokenType.TOKEN_LESS, "Expected \">\" after generics!");
         }
 
         return builder.toString();
@@ -2124,6 +2211,7 @@ public class Compiler {
                 String arg = parseIdentifier("Expected parameter name");
                 String typeName = consumeType("Expected type after parameter name");
                 Type type = Type.getType(typeName);
+                type.nullable = match(TokenType.TOKEN_QMARK);
 
                 parameters.add(type);
 
@@ -2135,8 +2223,10 @@ public class Compiler {
         consume(TokenType.TOKEN_RIGHT_PAREN, "Expected \")\" after parameters!");
 
         Type type = StackTypes.VOID;
-        if (!constructor && check(TokenType.TOKEN_COLON))
+        if (!constructor && check(TokenType.TOKEN_COLON)) {
             type = Type.getType(consumeType("Expected return type after \":\"!"));
+            type.nullable = match(TokenType.TOKEN_QMARK);
+        }
 
         MethodNode methodNode = compiler.getCurrentMethod(true);
 
@@ -2209,6 +2299,11 @@ public class Compiler {
 
             return;
         }
+        if (modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
+            error("Nested methods can not be inline!");
+
+            return;
+        }
 
         boolean isMethodStatic = !modifiersForNextElement.isEmpty() && modifiersForNextElement.contains(TokenType.TOKEN_STATIC);
         if (!isMethodStatic) {
@@ -2224,6 +2319,7 @@ public class Compiler {
                 String arg = parseIdentifier("Expect parameter name");
                 String typeName = consumeType("Expect type after parameter name");
                 Type type = Type.getType(typeName);
+                type.nullable = match(TokenType.TOKEN_QMARK);
 
                 locals.add(type);
 
@@ -2236,6 +2332,7 @@ public class Compiler {
         consume(TokenType.TOKEN_RIGHT_PAREN, "Expect \")\" after parameters");
 
         final Type type = Type.getType(consumeType("Expect return type after \":\""));
+        type.nullable = match(TokenType.TOKEN_QMARK);
 
         final MethodNode methodNode = compiler.getCurrentMethod(true);
 
@@ -2303,9 +2400,13 @@ public class Compiler {
 
         Pair<String, String> typeName = null;
         Type type = null;
+        boolean nullable = false;
+
         if (!inference) {
             typeName = new Pair<>(parseType("Expected type name after \":\"."), parseGenericType());
             type = Type.getType(typeName.k);
+            nullable = match(TokenType.TOKEN_QMARK);
+            type.nullable = nullable;
         } else {
             if (!check(TokenType.TOKEN_EQUAL)) {
                 error("Expected \"=\", can not infer type");
@@ -2317,18 +2418,24 @@ public class Compiler {
         boolean setValue = match(TokenType.TOKEN_EQUAL);
         if (setValue) {
             expression();
+            if (!nullable && peekLastStack().nullable) {
+                error("Nullable value assigned to variable!");
 
-            if (!inference)
-                convertLastStackForType(type);
-            else {
+                return;
+            }
+
+            if (!inference) {
+                if (!peekLastStack().nullable)
+                    convertLastStackForType(type);
+            } else {
                 type = peekLastStack();
                 typeName = new Pair<>(type.getDescriptor(), "");
             }
 
-            if (typeStack.isEmpty())
+            if (instanceStack.isEmpty())
                 error("Variable expression doesn't output anything");
-            if (typeStack.size() != 1)
-                error("Variable expression has multiple outputs: " + typeStack);
+            if (instanceStack.size() != 1)
+                error("Variable expression has multiple outputs: " + instanceStack);
         }
 
         if (this.type == CompilerType.CLASS || this.type == CompilerType.NESTED_CLASS) {
@@ -2339,6 +2446,9 @@ public class Compiler {
             FieldNode fieldNode = new FieldNode(modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0), name, type.getDescriptor(), null, null);
             if (!modifiersForNextElement.contains(TokenType.TOKEN_PRIVATE))
                 fieldNode.access |= Opcodes.ACC_PUBLIC;
+            if (nullable)
+                annotationsForNextElement.add(NULLABLE_ANNOTATION);
+            else annotationsForNextElement.add(NONNULL_ANNOTATION);
             fieldNode.visibleAnnotations = new ArrayList<>(annotationsForNextElement);
             annotationsForNextElement.clear();
 
@@ -2404,8 +2514,15 @@ public class Compiler {
         }
 
         expression();
+        boolean nullable = peekLastStack().nullable;
 
         final Type returnType = Type.getReturnType(getCurrentMethod(true).desc);
+        if (nullable && !returnType.nullable) {
+            error("Tried to return nullable value while the return value can not be null!");
+
+            return;
+        }
+
         if (!returnType.equals(StackTypes.STRING_TYPE))
             convertLastStackForType(returnType);
 
@@ -2442,7 +2559,7 @@ public class Compiler {
 
         compiler.getCurrentClass().methods.remove(compiler.getCurrentMethod(true));
 
-        typeStack.addAll(compiler.typeStack);
+        instanceStack.addAll(compiler.instanceStack);
 
         return new Pair<>(insnNodes, result);
     }
@@ -2459,7 +2576,7 @@ public class Compiler {
         compiler.getCurrentClass().methods.remove(compiler.getCurrentMethod(true));
 
         if (addToStack)
-            typeStack.addAll(compiler.typeStack);
+            instanceStack.addAll(compiler.instanceStack);
     }
 
     public void foreachStatement() {
@@ -2483,7 +2600,6 @@ public class Compiler {
 
         expression();
         DelayedInstruction delayedInstruction = this.delayedInstruction;
-        System.out.println(delayedInstruction);
         this.delayedInstruction = null;
         if (delayedInstruction != null)
             delayedInstruction.emitJump(this, l1);
