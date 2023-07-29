@@ -34,6 +34,9 @@ public class STDLib {
     public static String toString(Object a) {
         if (a == null)
             return "null";
+        if (a.getClass().isArray())
+            return arrayToString(a);
+
         return a.toString();
     }
 
@@ -41,9 +44,8 @@ public class STDLib {
     public static String arrayToString(Object a) {
         if (a == null)
             return "null";
-
         if (!a.getClass().isArray())
-            return a.toString();
+            return toString(a);
 
         int iMax = Array.getLength(a) - 1;
         if (iMax == -1)

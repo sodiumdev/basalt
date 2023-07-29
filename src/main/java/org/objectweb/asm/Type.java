@@ -29,6 +29,8 @@ package org.objectweb.asm;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A Java field or method type. This class can be used to make it easier to manipulate type and
@@ -146,6 +148,7 @@ public class Type {
   public final int valueEnd;
 
   public boolean nullable = false;
+  public String signature;
 
   /**
    * Constructs a reference type.
@@ -176,6 +179,28 @@ public class Type {
    */
   public static Type getType(final String typeDescriptor) {
     return getTypeInternal(typeDescriptor, 0, typeDescriptor.length());
+  }
+
+  public Type convertToPrimitiveIfPossible() {
+    if (equals(getType(Void.class)))
+      return VOID_TYPE;
+    else if (equals(getType(Boolean.class)))
+      return BOOLEAN_TYPE;
+    else if (equals(getType(Character.class)))
+      return CHAR_TYPE;
+    else if (equals(getType(Short.class)))
+      return SHORT_TYPE;
+    else if (equals(getType(Byte.class)))
+      return BYTE_TYPE;
+    else if (equals(getType(Integer.class)))
+      return INT_TYPE;
+    else if (equals(getType(Float.class)))
+      return FLOAT_TYPE;
+    else if (equals(getType(Long.class)))
+      return LONG_TYPE;
+    else if (equals(getType(Double.class)))
+      return DOUBLE_TYPE;
+    else return this;
   }
 
   public Type primitiveToObject() {

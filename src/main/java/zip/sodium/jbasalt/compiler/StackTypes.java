@@ -1,5 +1,6 @@
 package zip.sodium.jbasalt.compiler;
 
+import basalt.lang.Pointer;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.commons.InstructionAdapter;
@@ -7,6 +8,8 @@ import org.objectweb.asm.commons.InstructionAdapter;
 import java.util.Map;
 
 public final class StackTypes {
+    public static final Type POINTER_TYPE = Type.getType(Pointer.class);
+
     private StackTypes() {
         throw new AssertionError("Cannot instantiate StackTypes!");
     }

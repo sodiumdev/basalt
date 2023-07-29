@@ -1,6 +1,7 @@
  package zip.sodium.jbasalt.compiler;
 
 import basalt.lang.Inline;
+import org.apache.commons.lang3.StringUtils;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.objectweb.asm.*;
@@ -34,7 +35,6 @@ public class Compiler {
     public Parser parser;
     public Scanner scanner;
 
-    public static final String PRIMITIVE_DESCRIPTORS = "VZCBSIFJD";
     public static final List<Class<?>> PRIMITIVE_TYPES =
             List.of(void.class, boolean.class, char.class,
                     byte.class, short.class, int.class,
@@ -64,7 +64,8 @@ public class Compiler {
     public final String fileName;
     public final String filePackage;
 
-    public record Local(Type type, int index, String signature, LabelNode start) { }
+    public record Local(Type type, int index, LabelNode start) { }
+
     public record Pair<K, V>(K k, V v) {}
 
     public record InlineMethod(String owner, String name, String methodDescriptor) {}
@@ -136,7 +137,7 @@ public class Compiler {
         rules.put(TokenType.TOKEN_MINUS, new ParseRule(Compiler::unary, Compiler::binary, Precedence.PREC_TERM));
         rules.put(TokenType.TOKEN_PLUS, new ParseRule(null, Compiler::binary, Precedence.PREC_TERM));
         rules.put(TokenType.TOKEN_SLASH, new ParseRule(null, Compiler::binary, Precedence.PREC_FACTOR));
-        rules.put(TokenType.TOKEN_STAR, new ParseRule(null, Compiler::binary, Precedence.PREC_FACTOR));
+        rules.put(TokenType.TOKEN_STAR, new ParseRule(Compiler::dereference, Compiler::binary, Precedence.PREC_FACTOR));
 
         rules.put(TokenType.TOKEN_BANG, new ParseRule(Compiler::unary, null, Precedence.PREC_NONE));
         rules.put(TokenType.TOKEN_BANG_EQUAL, new ParseRule(null, Compiler::binary, Precedence.PREC_EQUALITY));
@@ -475,6 +476,71 @@ public class Compiler {
 
         emit(new TypeInsnNode(Opcodes.CHECKCAST, typeName));
         notifyReplaceLastStack(type);
+    }
+
+    public void reference() {
+        if (!peekLastStack().equals(StackTypes.POINTER_TYPE)) {
+            error("Can only dereference pointers!");
+
+            return;
+        }
+
+        String sig = peekLastStack().signature;
+        sig = StringUtils.replaceOnce(sig.substring(1, sig.length() - 1), StackTypes.POINTER_TYPE.getInternalName(), "");
+        sig = sig.substring(1, sig.length() - 1);
+
+        final Type sigType = Type.getType(sig);
+
+        emitSwap();
+        convertLastStackForType(sigType);
+
+        emit(new FieldInsnNode(Opcodes.PUTFIELD, "basalt/lang/Pointer", "value", "Ljava/lang/Object;"));
+        notifyPopStack();
+        notifyPopStack();
+    }
+
+    public void dereference(Local local) {
+        if (!local.type.equals(StackTypes.POINTER_TYPE)) {
+            error("Can only dereference pointers!");
+
+            return;
+        }
+
+        emit(new VarInsnNode(Opcodes.ALOAD, local.index));
+
+        String sig = local.type.signature;
+        sig = StringUtils.replaceOnce(sig.substring(1, sig.length() - 1), StackTypes.POINTER_TYPE.getInternalName(), "");
+        sig = sig.substring(1, sig.length() - 1);
+
+        final Type sigType = Type.getType(sig).convertToPrimitiveIfPossible();
+
+        emit(new FieldInsnNode(Opcodes.GETFIELD, "basalt/lang/Pointer", "value", "Ljava/lang/Object;"));
+        notifyPushStack(StackTypes.OBJECT_TYPE);
+        convertLastStackForType(sigType);
+    }
+
+    public void dereference() {
+        if (!peekLastStack().equals(StackTypes.POINTER_TYPE)) {
+            error("Can only dereference pointers!");
+
+            return;
+        }
+
+        String sig = notifyPopStack().signature;
+        sig = StringUtils.replaceOnce(sig.substring(1, sig.length() - 1), StackTypes.POINTER_TYPE.getInternalName(), "");
+        sig = sig.substring(1, sig.length() - 1);
+
+        final Type sigType = Type.getType(sig);
+
+        emit(new FieldInsnNode(Opcodes.GETFIELD, "basalt/lang/Pointer", "value", "Ljava/lang/Object;"));
+        notifyPushStack(StackTypes.OBJECT_TYPE);
+        convertLastStackForType(sigType);
+        notifyReplaceLastStack(sigType);
+    }
+
+    public void dereference(boolean canAssign) {
+        expression();
+        dereference();
     }
 
     public void binary(boolean canAssign) {
@@ -1104,9 +1170,16 @@ public class Compiler {
     }
 
     public void qDot(boolean canAssign) {
+        if (peekLastStack().equals(StackTypes.POINTER_TYPE))
+            dereference();
+
         if (!peekLastStack().nullable) {
             dot(canAssign);
             return;
+        }
+
+        if (peekLastStack().equals(StackTypes.POINTER_TYPE)) {
+            dereference(canAssign);
         }
 
         consume(TokenType.TOKEN_IDENTIFIER, "Expect property name after \".\"");
@@ -1160,8 +1233,12 @@ public class Compiler {
         consume(TokenType.TOKEN_IDENTIFIER, "Expect property name after \".\"");
         final String afterDot = parser.getPrevious().content();
 
+        if (peekLastStack() != null && peekLastStack().equals(StackTypes.POINTER_TYPE))
+            dereference();
+
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
+
             if (peekLastTypeStack() != null) try {
                 final Type fieldType = findFieldType(peekLastTypeStack(), afterDot);
 
@@ -1222,6 +1299,19 @@ public class Compiler {
             local = locals.get(identifier);
         else local = null;
 
+        Type localType = null;
+        if (local != null)
+            localType = local.type;
+
+        boolean isPointer = local != null && local.type.equals(StackTypes.POINTER_TYPE);
+        if (isPointer) {
+            String sig = local.type.signature;
+            sig = StringUtils.replaceOnce(sig.substring(1, sig.length() - 1), StackTypes.POINTER_TYPE.getInternalName(), "");
+            sig = sig.substring(1, sig.length() - 1);
+
+            localType = Type.getType(sig);
+        }
+
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
 
@@ -1245,10 +1335,17 @@ public class Compiler {
                 return;
             }
 
-            emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+            if (isPointer) {
+                convertLastStackForType(localType);
+
+                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
+                notifyPushStack(local.type);
+                reference();
+            } else emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_PLUS_EQUAL)) {
             final AbstractInsnNode[] nodes = captureInstructions(compiler -> {
-                compiler.expression();
+                if (!isPointer)
+                    compiler.expression();
 
                 return null;
             }).k;
@@ -1284,18 +1381,31 @@ public class Compiler {
                 return;
             }
 
-            convertLastStackForType(local.type);
+            localType = localType.convertToPrimitiveIfPossible();
 
+            if (isPointer) {
+                dereference(local);
+                notifyPopStack();
+            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ILOAD), local.index));
+            notifyPushStack(localType);
+
+            expression();
+            convertLastStackForType(localType);
             notifyPopStack();
 
-            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
-            emit(nodes);
-            emit(new InsnNode(local.type.getOpcode(Opcodes.IADD)));
+            emit(new InsnNode(localType.getOpcode(Opcodes.IADD)));
 
-            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ISTORE), local.index));
+            if (isPointer) {
+                convertLastStackForType(localType);
+
+                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
+                notifyPushStack(local.type);
+                reference();
+            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_MINUS_EQUAL)) {
             final AbstractInsnNode[] nodes = captureInstructions(compiler -> {
-                compiler.expression();
+                if (!isPointer)
+                    compiler.expression();
 
                 return null;
             }).k;
@@ -1332,16 +1442,28 @@ public class Compiler {
                 return;
             }
 
-            convertLastStackForType(local.type);
+            localType = localType.convertToPrimitiveIfPossible();
 
+            if (isPointer) {
+                dereference(local);
+                notifyPopStack();
+            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ILOAD), local.index));
+            notifyPushStack(localType);
+
+            expression();
+            convertLastStackForType(localType);
             notifyPopStack();
 
-            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
-            emit(nodes);
-            emit(new InsnNode(local.type.getOpcode(Opcodes.INEG)));
-            emit(new InsnNode(local.type.getOpcode(Opcodes.IADD)));
+            emit(new InsnNode(localType.getOpcode(Opcodes.INEG)));
+            emit(new InsnNode(localType.getOpcode(Opcodes.IADD)));
 
-            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ISTORE), local.index));
+            if (isPointer) {
+                convertLastStackForType(localType);
+
+                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
+                notifyPushStack(local.type);
+                reference();
+            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_STAR_EQUAL)) {
             expression();
 
@@ -1368,13 +1490,25 @@ public class Compiler {
                 return;
             }
 
-            emit(new VarInsnNode(peekLastStack().getOpcode(Opcodes.ILOAD), local.index));
+            convertLastStackForType(localType = localType.convertToPrimitiveIfPossible());
+            notifyPopStack();
+
+            if (isPointer) {
+                dereference(local);
+                notifyPopStack();
+            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ILOAD), local.index));
+            notifyPushStack(localType);
             emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IMUL)));
 
-            emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+            if (isPointer) {
+                convertLastStackForType(localType);
+
+                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
+                notifyPushStack(local.type);
+                reference();
+            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_SLASH_EQUAL)) {
             expression();
-
 
             final List<InlineField> clone = new ArrayList<>(inlineFields);
             Collections.reverse(clone);
@@ -1399,10 +1533,23 @@ public class Compiler {
                 return;
             }
 
-            emit(new VarInsnNode(peekLastStack().getOpcode(Opcodes.ILOAD), local.index));
+            convertLastStackForType(localType = localType.convertToPrimitiveIfPossible());
+            notifyPopStack();
+
+            if (isPointer) {
+                dereference(local);
+                notifyPopStack();
+            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ILOAD), local.index));
+            notifyPushStack(localType);
             emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IDIV)));
 
-            emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+            if (isPointer) {
+                convertLastStackForType(localType);
+
+                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
+                notifyPushStack(local.type);
+                reference();
+            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ISTORE), local.index));
         } else {
             if (check(TokenType.TOKEN_LEFT_PAREN) && local == null) {
                 if (inlineMethods.stream().noneMatch(x -> x.name.equals(identifier))) {
@@ -1424,16 +1571,18 @@ public class Compiler {
             if (classNameReplacements.containsKey(identifier)) {
                 final String rep = classNameReplacements.get(identifier).replace("/", ".");
 
-                final Class<?> repClass;
+                Type repClass = null;
                 try {
-                    repClass = Class.forName(rep, true, runner);
+                    if (rep.equals(currentClass))
+                        repClass = Type.getType(Class.forName(rep, true, runner));
+                    else repClass = Type.getType("L" + getCurrentClass().name + ";");
                 } catch (ClassNotFoundException e) {
                     e.printStackTrace();
                     return;
                 }
 
-                notifyPushTypeStack(Type.getType(repClass));
-            } else if (getCurrentClass().methods.stream().noneMatch(m -> identifier.equals(m.name))) {
+                notifyPushTypeStack(repClass);
+            } else if (!check(TokenType.TOKEN_LEFT_PAREN)) {
                 final List<InlineField> clone = new ArrayList<>(inlineFields);
                 Collections.reverse(clone);
 
@@ -1656,6 +1805,12 @@ public class Compiler {
     public void specialDot(boolean canAssign) {
         consume(TokenType.TOKEN_IDENTIFIER, "Expected identifier after \":\"!");
         final String content = parser.getPrevious().content();
+
+        if (peekLastStack() != null && peekLastStack().equals(StackTypes.POINTER_TYPE)) {
+            error("Can't apply \":\" to pointers!");
+
+            return;
+        }
 
         consume(TokenType.TOKEN_LEFT_PAREN, "Expected \"(\" after \"" + content + "\"!");
         final Pair<AbstractInsnNode[], Object> insns = captureInstructions(Compiler::argumentList);
@@ -1944,12 +2099,7 @@ public class Compiler {
             notifyReplaceLastStack(StackTypes.INT);
             return;
         }
-        if (StackTypes.isTypeStackIntegerType(lastStack)) {
-            emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/Integer", "intValue", "()I"));
-            notifyReplaceLastStack(StackTypes.INT);
-            return;
-        }
-        if (StackTypes.isTypeStackPureObject(lastStack)) {
+        if (StackTypes.isTypeStackIntegerType(lastStack) || StackTypes.isTypeStackPureObject(lastStack)) {
             emit(new TypeInsnNode(Opcodes.CHECKCAST, "java/lang/Integer"));
             emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/Integer", "intValue", "()I"));
             notifyReplaceLastStack(StackTypes.INT);
@@ -2219,7 +2369,7 @@ public class Compiler {
         boolean isMethodStatic = !modifiersForNextElement.isEmpty() && modifiersForNextElement.contains(TokenType.TOKEN_STATIC);
         if (!isMethodStatic) {
             final Type thisType = Type.getType("L" + getCurrentClass().name + ";");
-            compiler.locals.put("this", new Local(thisType, 0, null, start));
+            compiler.locals.put("this", new Local(thisType, 0, start));
 
             compiler.maxLocals += thisType.getSize();
         }
@@ -2227,14 +2377,29 @@ public class Compiler {
         final List<Type> parameters = new ArrayList<>();
         if (!check(TokenType.TOKEN_RIGHT_PAREN)) {
             do {
+                boolean pointer = match(TokenType.TOKEN_STAR);
                 String arg = parseIdentifier("Expected parameter name");
                 String typeName = consumeType("Expected type after parameter name");
+                String generics = parseGenericType();
                 Type type = Type.getType(typeName);
                 type.nullable = match(TokenType.TOKEN_QMARK);
+                if (pointer && type.nullable) {
+                    error("A pointer can not be nullable!");
+
+                    return;
+                }
+
+                Type baseType = Type.getType(typeName);
+                if (pointer)
+                    baseType = baseType.primitiveToObject();
+                type = pointer ? StackTypes.POINTER_TYPE : baseType;
+                String signature = baseType.getDescriptor().replace(";", "") + generics + ";";
+                signature = pointer ? ("L" + type.getInternalName() + "<" + signature + ">;") : signature;
+                type.signature = signature;
 
                 parameters.add(type);
 
-                compiler.locals.put(arg, new Local(type, compiler.maxLocals, null, start));
+                compiler.locals.put(arg, new Local(type, compiler.maxLocals, start));
                 compiler.maxLocals += type.getSize();
             } while (match(TokenType.TOKEN_COMMA));
         }
@@ -2297,7 +2462,7 @@ public class Compiler {
         for (Map.Entry<String, Local> entry : compiler.locals.entrySet()) {
             final Local local = entry.getValue();
 
-            methodNode.localVariables.add(new LocalVariableNode(entry.getKey(), local.type.getDescriptor(), local.signature, local.start, end, local.index));
+            methodNode.localVariables.add(new LocalVariableNode(entry.getKey(), local.type.getDescriptor(), local.type.signature, local.start, end, local.index));
         }
     }
 
@@ -2327,7 +2492,7 @@ public class Compiler {
         boolean isMethodStatic = !modifiersForNextElement.isEmpty() && modifiersForNextElement.contains(TokenType.TOKEN_STATIC);
         if (!isMethodStatic) {
             final Type thisType = Type.getType("L" + getCurrentClass().name + ";");
-            compiler.locals.put("this", new Local(thisType, 0, null, start));
+            compiler.locals.put("this", new Local(thisType, 0, start));
 
             compiler.maxLocals += thisType.getSize();
         }
@@ -2335,16 +2500,30 @@ public class Compiler {
         final List<Type> locals = new ArrayList<>();
         if (!check(TokenType.TOKEN_RIGHT_PAREN)) {
             do {
-                String arg = parseIdentifier("Expect parameter name");
-                String typeName = consumeType("Expect type after parameter name");
+                boolean pointer = match(TokenType.TOKEN_STAR);
+                String arg = parseIdentifier("Expected parameter name");
+                String typeName = consumeType("Expected type after parameter name");
+                String generics = parseGenericType();
                 Type type = Type.getType(typeName);
                 type.nullable = match(TokenType.TOKEN_QMARK);
+                if (pointer && type.nullable) {
+                    error("A pointer can not be nullable!");
+
+                    return;
+                }
+
+                Type baseType = Type.getType(typeName);
+                if (pointer)
+                    baseType = baseType.primitiveToObject();
+                type = pointer ? StackTypes.POINTER_TYPE : baseType;
+                String signature = baseType.getDescriptor().replace(";", "") + generics + ";";
+                signature = pointer ? ("L" + type.getInternalName() + "<" + signature + ">;") : signature;
+                type.signature = signature;
 
                 locals.add(type);
 
-                // ADDED STATIC TYPING -sodium
-                compiler.locals.put(arg, new Local(type, compiler.maxLocals, null, start));
-                compiler.maxLocals += type.getSize();
+                compiler.locals.put(arg, new Local(type, compiler.maxLocals, start));
+                compiler.maxLocals += type.getSize();;
             } while (match(TokenType.TOKEN_COMMA));
         }
 
@@ -2386,7 +2565,7 @@ public class Compiler {
             if (local.start == null)
                 continue;
 
-            methodNode.localVariables.add(new LocalVariableNode(entry.getKey(), local.type.getDescriptor(), local.signature, local.start, end, local.index));
+            methodNode.localVariables.add(new LocalVariableNode(entry.getKey(), local.type.getDescriptor(), local.type.signature, local.start, end, local.index));
         }
 
         methodNameReplacements.put(name, jvmName);
@@ -2413,18 +2592,31 @@ public class Compiler {
                 emitToInit(new VarInsnNode(Opcodes.ALOAD, 0));
         }
 
+        boolean pointer = match(TokenType.TOKEN_STAR);
         String name = parseIdentifier("Expect variable name.");
 
         boolean inference = !match(TokenType.TOKEN_COLON);
 
-        Pair<String, String> typeName = null;
+        Pair<String, String> typeName;
         Type type = null;
+        Type baseType = null;
         boolean nullable = false;
+        String signature = null;
 
         if (!inference) {
             typeName = new Pair<>(parseType("Expected type name after \":\"."), parseGenericType());
-            type = Type.getType(typeName.k);
+            baseType = Type.getType(typeName.k);
+            if (pointer)
+                baseType = baseType.primitiveToObject();
+            type = pointer ? StackTypes.POINTER_TYPE : baseType;
+            signature = baseType.getDescriptor().replace(";", "") + typeName.v + ";";
+            signature = pointer ? ("L" + type.getInternalName() + "<" + signature + ">;") : signature;
             nullable = match(TokenType.TOKEN_QMARK);
+            if (pointer && nullable) {
+                error("A pointer can not be nullable!");
+
+                return;
+            }
             type.nullable = nullable;
         } else {
             if (!check(TokenType.TOKEN_EQUAL)) {
@@ -2444,12 +2636,15 @@ public class Compiler {
             }
 
             if (!inference) {
-                if (!peekLastStack().nullable)
-                    convertLastStackForType(type);
-            } else {
-                type = peekLastStack();
-                typeName = new Pair<>(type.getDescriptor(), "");
-            }
+                if (!peekLastStack().nullable) {
+                    convertLastStackForType(baseType);
+                }
+                if (pointer) {
+                    convertLastStackToObject();
+                    emit(new MethodInsnNode(Opcodes.INVOKESTATIC, "basalt/lang/Pointer", "of", "(Ljava/lang/Object;)Lbasalt/lang/Pointer;"));
+                    notifyReplaceLastStack(type);
+                }
+            } else type = peekLastStack();
 
             if (instanceStack.isEmpty())
                 error("Variable expression doesn't output anything");
@@ -2457,12 +2652,14 @@ public class Compiler {
                 error("Variable expression has multiple outputs: " + instanceStack);
         }
 
+        type.signature = signature;
+
         if (this.type == CompilerType.CLASS || this.type == CompilerType.NESTED_CLASS) {
             if (modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
                 annotationsForNextElement.add(INLINE_ANNOTATION);
                 modifiersForNextElement.add(TokenType.TOKEN_STATIC);
             }
-            FieldNode fieldNode = new FieldNode(modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0), name, type.getDescriptor(), null, null);
+            FieldNode fieldNode = new FieldNode(modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0), name, type.getDescriptor(), type.signature, null);
             if (!modifiersForNextElement.contains(TokenType.TOKEN_PRIVATE))
                 fieldNode.access |= Opcodes.ACC_PUBLIC;
             if (nullable)
@@ -2492,7 +2689,7 @@ public class Compiler {
                 return;
             }
 
-            Local local = new Local(type, maxLocals, typeName.v.isEmpty() ? null : (typeName.k.replace(";", "") + typeName.v + ";"), start);
+            Local local = new Local(type, maxLocals, start);
             maxLocals += type.getSize();
             if (setValue)
                 emit(new VarInsnNode(type.getOpcode(Opcodes.ISTORE), local.index));
@@ -2697,6 +2894,8 @@ public class Compiler {
         classNode.name = (filePackage.replace(".", "/") + "/%s").formatted(className);
         if (!definedSuperclass)
             classNode.superName = "java/lang/Object";
+
+        classNameReplacements.put(className, classNode.name);
 
         if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC)) {
             error("Classes can not be magic!");
