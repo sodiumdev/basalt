@@ -307,6 +307,7 @@ public class Compiler {
         return parseType("Expected type name after \":\".");
     }
 
+    @SuppressWarnings("unused")
     public Pair<String, String> consumeGenericType(String error) {
         consume(TokenType.TOKEN_COLON, error);
 
@@ -335,6 +336,7 @@ public class Compiler {
             getCurrentMethod(true).instructions.add(node);
     }
 
+    @SuppressWarnings("unused")
     public void emit(InsnList nodes) {
         emitDelayedConstant();
         for (AbstractInsnNode node : nodes)
@@ -969,6 +971,7 @@ public class Compiler {
         }
     }
 
+    @SuppressWarnings("unused")
     public Class<?>[] typeToClass(Type[] types) {
         return Arrays.stream(types).map(this::typeToClass).toArray(Class[]::new);
     }
@@ -1218,7 +1221,7 @@ public class Compiler {
                 if (staticExtensionMethods.containsKey(peekLastTypeStack().getInternalName())) {
                     BasaltMethod method = staticExtensionMethods.get(notifyPopTypeStack().getInternalName())
                             .stream()
-                            .filter(x -> x.name.equals(afterDot)).findAny().get();
+                            .filter(x -> x.name.equals(afterDot)).findAny().orElseThrow();
 
                     notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, method.owner, method.name, false));
                 } else notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot, false));
@@ -1226,7 +1229,7 @@ public class Compiler {
                 if (extensionMethods.containsKey(peekLastStack().getInternalName())) {
                     BasaltMethod method = extensionMethods.get(notifyPopStack().getInternalName())
                             .stream()
-                            .filter(x -> x.name.equals(afterDot)).findAny().get();
+                            .filter(x -> x.name.equals(afterDot)).findAny().orElseThrow();
 
                     notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, method.owner, method.name, true));
                 } else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot, false));
@@ -1495,7 +1498,7 @@ public class Compiler {
                 if (isField && (type == CompilerType.CLASS || type == CompilerType.NESTED_CLASS)) {
                     final String desc = getCurrentClass().fields.stream()
                             .filter(x -> Objects.equals(x.name, identifier))
-                            .findAny().get().desc;
+                            .findAny().orElseThrow().desc;
 
                     if (isFieldStatic)
                         emit(new FieldInsnNode(Opcodes.GETSTATIC, getCurrentClass().name, identifier, desc));
@@ -2059,6 +2062,7 @@ public class Compiler {
         return typeStack.isEmpty() ? null : typeStack.peek();
     }
 
+    @SuppressWarnings("unused")
     public void notifyReplaceLastTypeStack(Type type) {
         notifyPopTypeStack();
         notifyPushTypeStack(type);
@@ -2493,7 +2497,7 @@ public class Compiler {
         Pair<String, String> typeName;
         Type type = null;
         boolean nullable = false;
-        String signature = null;
+        String signature;
 
         if (!inference) {
             typeName = new Pair<>(parseType("Expected type name after \":\"."), parseGenericType());
@@ -2501,6 +2505,7 @@ public class Compiler {
             signature = type.getDescriptor().replace(";", "") + typeName.v + ";";
             nullable = match(TokenType.TOKEN_QMARK);
             type.nullable = nullable;
+            type.signature = signature;
         } else {
             if (!check(TokenType.TOKEN_EQUAL)) {
                 error("Expected \"=\", can not infer type");
@@ -2529,8 +2534,6 @@ public class Compiler {
             if (instanceStack.size() != 1)
                 error("Variable expression has multiple outputs: " + instanceStack);
         }
-
-        type.signature = signature;
 
         if (this.type == CompilerType.CLASS || this.type == CompilerType.NESTED_CLASS) {
             if (modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
@@ -2590,6 +2593,7 @@ public class Compiler {
             getCurrentClass().methods.get(0).instructions.add(node);
     }
 
+    @SuppressWarnings("unused")
     private void emitToClinit(AbstractInsnNode... nodes) {
         emitDelayedConstant();
         for (AbstractInsnNode node : nodes)
@@ -2662,6 +2666,7 @@ public class Compiler {
         return new Pair<>(insnNodes, result);
     }
 
+    @SuppressWarnings("unused")
     private void captureInstructions(Consumer<Compiler> consumer, boolean addToStack) {
         final Compiler compiler = new Compiler(CompilerType.METHOD, this);
         compiler.getCurrentClass().methods.add(compiler.getCurrentMethod(true));
@@ -2985,6 +2990,7 @@ public class Compiler {
         runner.classes.put(getCurrentClass().name.replace("/", "."), bytes);
     }
 
+    @SuppressWarnings("unused")
     public static void compileAndRun(String source, String... arguments) throws InvocationTargetException {
         EphemeralRunner runner = new EphemeralRunner(Thread.currentThread().getContextClassLoader());
 
