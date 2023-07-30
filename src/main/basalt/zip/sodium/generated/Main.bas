@@ -4,13 +4,11 @@ import java.lang.String
 import java.lang.Object
 
 class Main {
-    fn doStuff() {
+    static fn String:doStuff() {
         println("hi")
     }
 
     static fn main(args: String[]) {
-        let main = Main:new()
-
-        main.doStuff()
+        String.doStuff()
     }
 }

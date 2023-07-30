@@ -1,7 +1,8 @@
  package zip.sodium.jbasalt.compiler;
 
+import basalt.lang.ExtensionType;
 import basalt.lang.Inline;
-import org.apache.commons.lang3.StringUtils;
+import basalt.lang.MapUtils;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.objectweb.asm.*;
@@ -31,6 +32,15 @@ public class Compiler {
     private static final AnnotationNode NULLABLE_ANNOTATION = new AnnotationNode("Lorg/jetbrains/annotations/Nullable;");
     private static final AnnotationNode NONNULL_ANNOTATION = new AnnotationNode("Lorg/jetbrains/annotations/NotNull;");
 
+    private static AnnotationNode createExtensionAnnotation(ExtensionType type, Type extendingClass) {
+        final AnnotationNode extensionAnnotation = new AnnotationNode("Lbasalt/lang/Extension;");
+
+        extensionAnnotation.visitEnum("type", "Lbasalt/lang/ExtensionType;", type.name());
+        extensionAnnotation.visit("extendingClass", extendingClass);
+
+        return extensionAnnotation;
+    }
+
     private CompilerType type;
     public Parser parser;
     public Scanner scanner;
@@ -42,6 +52,9 @@ public class Compiler {
 
     private final Map<String, String> classNameReplacements = new HashMap<>();
     private final Map<String, String> methodNameReplacements = new HashMap<>();
+
+    private static final Map<String, List<BasaltMethod>> extensionMethods = new HashMap<>();
+    private static final Map<String, List<BasaltMethod>> staticExtensionMethods = new HashMap<>();
 
     private static final Set<AnnotationNode> annotationsForNextElement = new HashSet<>();
     private static final Set<TokenType> modifiersForNextElement = new HashSet<>();
@@ -68,16 +81,16 @@ public class Compiler {
 
     public record Pair<K, V>(K k, V v) {}
 
-    public record InlineMethod(String owner, String name, String methodDescriptor) {}
-    public record InlineField(String owner, String name, Type type) {}
+    public record BasaltMethod(String owner, String name, String methodDescriptor) {}
+    public record BasaltField(String owner, String name, Type type) {}
 
-    private final List<InlineMethod> inlineMethods = new ArrayList<>();
-    private final List<InlineField> inlineFields = new ArrayList<>();
+    private final List<BasaltMethod> inlineMethods = new ArrayList<>();
+    private final List<BasaltField> inlineFields = new ArrayList<>();
 
     /**
      * - {@link #callStack}
      */
-    public record MethodCall(int opcode, String owner, String name) {}
+    public record MethodCall(int opcode, String owner, String name, boolean extension) {}
 
     /**
      * - {@link #peekLastTypeStack()}
@@ -137,7 +150,7 @@ public class Compiler {
         rules.put(TokenType.TOKEN_MINUS, new ParseRule(Compiler::unary, Compiler::binary, Precedence.PREC_TERM));
         rules.put(TokenType.TOKEN_PLUS, new ParseRule(null, Compiler::binary, Precedence.PREC_TERM));
         rules.put(TokenType.TOKEN_SLASH, new ParseRule(null, Compiler::binary, Precedence.PREC_FACTOR));
-        rules.put(TokenType.TOKEN_STAR, new ParseRule(Compiler::dereference, Compiler::binary, Precedence.PREC_FACTOR));
+        rules.put(TokenType.TOKEN_STAR, new ParseRule(null, Compiler::binary, Precedence.PREC_FACTOR));
 
         rules.put(TokenType.TOKEN_BANG, new ParseRule(Compiler::unary, null, Precedence.PREC_NONE));
         rules.put(TokenType.TOKEN_BANG_EQUAL, new ParseRule(null, Compiler::binary, Precedence.PREC_EQUALITY));
@@ -476,71 +489,6 @@ public class Compiler {
 
         emit(new TypeInsnNode(Opcodes.CHECKCAST, typeName));
         notifyReplaceLastStack(type);
-    }
-
-    public void reference() {
-        if (!peekLastStack().equals(StackTypes.POINTER_TYPE)) {
-            error("Can only dereference pointers!");
-
-            return;
-        }
-
-        String sig = peekLastStack().signature;
-        sig = StringUtils.replaceOnce(sig.substring(1, sig.length() - 1), StackTypes.POINTER_TYPE.getInternalName(), "");
-        sig = sig.substring(1, sig.length() - 1);
-
-        final Type sigType = Type.getType(sig);
-
-        emitSwap();
-        convertLastStackForType(sigType);
-
-        emit(new FieldInsnNode(Opcodes.PUTFIELD, "basalt/lang/Pointer", "value", "Ljava/lang/Object;"));
-        notifyPopStack();
-        notifyPopStack();
-    }
-
-    public void dereference(Local local) {
-        if (!local.type.equals(StackTypes.POINTER_TYPE)) {
-            error("Can only dereference pointers!");
-
-            return;
-        }
-
-        emit(new VarInsnNode(Opcodes.ALOAD, local.index));
-
-        String sig = local.type.signature;
-        sig = StringUtils.replaceOnce(sig.substring(1, sig.length() - 1), StackTypes.POINTER_TYPE.getInternalName(), "");
-        sig = sig.substring(1, sig.length() - 1);
-
-        final Type sigType = Type.getType(sig).convertToPrimitiveIfPossible();
-
-        emit(new FieldInsnNode(Opcodes.GETFIELD, "basalt/lang/Pointer", "value", "Ljava/lang/Object;"));
-        notifyPushStack(StackTypes.OBJECT_TYPE);
-        convertLastStackForType(sigType);
-    }
-
-    public void dereference() {
-        if (!peekLastStack().equals(StackTypes.POINTER_TYPE)) {
-            error("Can only dereference pointers!");
-
-            return;
-        }
-
-        String sig = notifyPopStack().signature;
-        sig = StringUtils.replaceOnce(sig.substring(1, sig.length() - 1), StackTypes.POINTER_TYPE.getInternalName(), "");
-        sig = sig.substring(1, sig.length() - 1);
-
-        final Type sigType = Type.getType(sig);
-
-        emit(new FieldInsnNode(Opcodes.GETFIELD, "basalt/lang/Pointer", "value", "Ljava/lang/Object;"));
-        notifyPushStack(StackTypes.OBJECT_TYPE);
-        convertLastStackForType(sigType);
-        notifyReplaceLastStack(sigType);
-    }
-
-    public void dereference(boolean canAssign) {
-        expression();
-        dereference();
     }
 
     public void binary(boolean canAssign) {
@@ -1038,16 +986,17 @@ public class Compiler {
         final List<Type> args = argumentList();
 
         String descriptor = null;
+        int arity = args.size();
+        if (call.extension)
+            arity++;
 
         if (call.owner.equals(getCurrentClass().name))
             for (MethodNode method : getCurrentClass().methods) {
-                if (opcode == Opcodes.INVOKESTATIC && !Modifier.isStatic(method.access))
-                    continue;
                 if (!method.name.equals(call.name) && !methodNameReplacements.containsValue(call.name))
                     continue;
 
                 final Type[] methodArgs = Type.getArgumentTypes(method.desc);
-                if (args.size() != methodArgs.length)
+                if (arity != methodArgs.length)
                     continue;
 
                 for (int i = 0; i < args.size(); i++) {
@@ -1070,14 +1019,13 @@ public class Compiler {
             for (Method method : clazz.getDeclaredMethods()){
                 if (!method.getName().equals(call.name) && !methodNameReplacements.containsValue(call.name))
                     continue;
-                if (args.size() != method.getParameterCount())
+                if (arity != method.getParameterCount())
                     continue;
 
                 for (int i = 0; i < args.size(); i++) {
                     convertLastStackForType(Type.getType(method.getParameterTypes()[i]));
                     notifyPopStack();
                 }
-
 
                 descriptor = Type.getMethodDescriptor(method);
                 if (opcode == -1) {
@@ -1107,10 +1055,10 @@ public class Compiler {
     public void callInlineMethod(String identifier) {
         final List<Type> args = argumentList();
 
-        final List<InlineMethod> clone = new ArrayList<>(inlineMethods);
+        final List<BasaltMethod> clone = new ArrayList<>(inlineMethods);
         Collections.reverse(clone);
 
-        InlineMethod method = clone.stream().filter(x ->
+        BasaltMethod method = clone.stream().filter(x ->
                 x.name.equals(identifier)
                         && Type.getArgumentTypes(x.methodDescriptor).length == args.size()
         ).findFirst().orElseThrow();
@@ -1170,19 +1118,12 @@ public class Compiler {
     }
 
     public void qDot(boolean canAssign) {
-        if (peekLastStack().equals(StackTypes.POINTER_TYPE))
-            dereference();
-
         if (!peekLastStack().nullable) {
             dot(canAssign);
             return;
         }
 
-        if (peekLastStack().equals(StackTypes.POINTER_TYPE)) {
-            dereference(canAssign);
-        }
-
-        consume(TokenType.TOKEN_IDENTIFIER, "Expect property name after \".\"");
+        consume(TokenType.TOKEN_IDENTIFIER, "Expect property name!");
         final String afterDot = parser.getPrevious().content();
 
         LabelNode l2 = new LabelNode();
@@ -1217,8 +1158,8 @@ public class Compiler {
         }
 
         if (peekLastTypeStack() != null)
-            notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot));
-        else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot));
+            notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot, false));
+        else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot, false));
 
         call(false);
         convertLastStackToObject();
@@ -1230,11 +1171,8 @@ public class Compiler {
     }
 
     public void dot(boolean canAssign) {
-        consume(TokenType.TOKEN_IDENTIFIER, "Expect property name after \".\"");
+        consume(TokenType.TOKEN_IDENTIFIER, "Expect property name!");
         final String afterDot = parser.getPrevious().content();
-
-        if (peekLastStack() != null && peekLastStack().equals(StackTypes.POINTER_TYPE))
-            dereference();
 
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
@@ -1276,9 +1214,23 @@ public class Compiler {
                 return;
             }
 
-            if (peekLastTypeStack() != null)
-                notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot));
-            else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot));
+            if (peekLastTypeStack() != null) {
+                if (staticExtensionMethods.containsKey(peekLastTypeStack().getInternalName())) {
+                    BasaltMethod method = staticExtensionMethods.get(notifyPopTypeStack().getInternalName())
+                            .stream()
+                            .filter(x -> x.name.equals(afterDot)).findAny().get();
+
+                    notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, method.owner, method.name, false));
+                } else notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot, false));
+            } else {
+                if (extensionMethods.containsKey(peekLastStack().getInternalName())) {
+                    BasaltMethod method = extensionMethods.get(notifyPopStack().getInternalName())
+                            .stream()
+                            .filter(x -> x.name.equals(afterDot)).findAny().get();
+
+                    notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, method.owner, method.name, true));
+                } else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot, false));
+            }
         }
     }
 
@@ -1299,28 +1251,15 @@ public class Compiler {
             local = locals.get(identifier);
         else local = null;
 
-        Type localType = null;
-        if (local != null)
-            localType = local.type;
-
-        boolean isPointer = local != null && local.type.equals(StackTypes.POINTER_TYPE);
-        if (isPointer) {
-            String sig = local.type.signature;
-            sig = StringUtils.replaceOnce(sig.substring(1, sig.length() - 1), StackTypes.POINTER_TYPE.getInternalName(), "");
-            sig = sig.substring(1, sig.length() - 1);
-
-            localType = Type.getType(sig);
-        }
-
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
 
-            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            final List<BasaltField> clone = new ArrayList<>(inlineFields);
             Collections.reverse(clone);
 
-            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            Optional<BasaltField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
             if (oInlineField.isPresent()) {
-                final InlineField inlineField = oInlineField.get();
+                final BasaltField inlineField = oInlineField.get();
                 convertLastStackForType(inlineField.type);
 
                 emit(new FieldInsnNode(Opcodes.PUTSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
@@ -1335,27 +1274,21 @@ public class Compiler {
                 return;
             }
 
-            if (isPointer) {
-                convertLastStackForType(localType);
-
-                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
-                notifyPushStack(local.type);
-                reference();
-            } else emit(new VarInsnNode(notifyPopStack().getOpcode(Opcodes.ISTORE), local.index));
+            convertLastStackForType(local.type);
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_PLUS_EQUAL)) {
             final AbstractInsnNode[] nodes = captureInstructions(compiler -> {
-                if (!isPointer)
-                    compiler.expression();
+                compiler.expression();
 
                 return null;
             }).k;
 
-            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            final List<BasaltField> clone = new ArrayList<>(inlineFields);
             Collections.reverse(clone);
 
-            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            Optional<BasaltField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
             if (oInlineField.isPresent()) {
-                final InlineField inlineField = oInlineField.get();
+                final BasaltField inlineField = oInlineField.get();
                 emit(nodes);
                 convertLastStackForType(inlineField.type);
 
@@ -1381,41 +1314,27 @@ public class Compiler {
                 return;
             }
 
-            localType = localType.convertToPrimitiveIfPossible();
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
 
-            if (isPointer) {
-                dereference(local);
-                notifyPopStack();
-            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ILOAD), local.index));
-            notifyPushStack(localType);
-
-            expression();
-            convertLastStackForType(localType);
+            emit(nodes);
+            convertLastStackForType(local.type);
             notifyPopStack();
 
-            emit(new InsnNode(localType.getOpcode(Opcodes.IADD)));
-
-            if (isPointer) {
-                convertLastStackForType(localType);
-
-                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
-                notifyPushStack(local.type);
-                reference();
-            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ISTORE), local.index));
+            emit(new InsnNode(local.type.getOpcode(Opcodes.IADD)));
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_MINUS_EQUAL)) {
             final AbstractInsnNode[] nodes = captureInstructions(compiler -> {
-                if (!isPointer)
-                    compiler.expression();
+                compiler.expression();
 
                 return null;
             }).k;
 
-            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            final List<BasaltField> clone = new ArrayList<>(inlineFields);
             Collections.reverse(clone);
 
-            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            Optional<BasaltField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
             if (oInlineField.isPresent()) {
-                final InlineField inlineField = oInlineField.get();
+                final BasaltField inlineField = oInlineField.get();
                 emit(nodes);
                 convertLastStackForType(inlineField.type);
                 emit(new InsnNode(inlineField.type.getOpcode(Opcodes.INEG)));
@@ -1442,37 +1361,24 @@ public class Compiler {
                 return;
             }
 
-            localType = localType.convertToPrimitiveIfPossible();
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
 
-            if (isPointer) {
-                dereference(local);
-                notifyPopStack();
-            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ILOAD), local.index));
-            notifyPushStack(localType);
-
-            expression();
-            convertLastStackForType(localType);
+            emit(nodes);
+            convertLastStackForType(local.type);
             notifyPopStack();
 
-            emit(new InsnNode(localType.getOpcode(Opcodes.INEG)));
-            emit(new InsnNode(localType.getOpcode(Opcodes.IADD)));
-
-            if (isPointer) {
-                convertLastStackForType(localType);
-
-                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
-                notifyPushStack(local.type);
-                reference();
-            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ISTORE), local.index));
+            emit(new InsnNode(local.type.getOpcode(Opcodes.INEG)));
+            emit(new InsnNode(local.type.getOpcode(Opcodes.IADD)));
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_STAR_EQUAL)) {
             expression();
 
-            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            final List<BasaltField> clone = new ArrayList<>(inlineFields);
             Collections.reverse(clone);
 
-            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            Optional<BasaltField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
             if (oInlineField.isPresent()) {
-                final InlineField inlineField = oInlineField.get();
+                final BasaltField inlineField = oInlineField.get();
                 convertLastStackForType(inlineField.type);
 
                 emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
@@ -1490,32 +1396,22 @@ public class Compiler {
                 return;
             }
 
-            convertLastStackForType(localType = localType.convertToPrimitiveIfPossible());
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
+
+            convertLastStackForType(local.type);
             notifyPopStack();
 
-            if (isPointer) {
-                dereference(local);
-                notifyPopStack();
-            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ILOAD), local.index));
-            notifyPushStack(localType);
-            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IMUL)));
-
-            if (isPointer) {
-                convertLastStackForType(localType);
-
-                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
-                notifyPushStack(local.type);
-                reference();
-            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ISTORE), local.index));
+            emit(new InsnNode(local.type.getOpcode(Opcodes.IMUL)));
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ISTORE), local.index));
         } else if (canAssign && match(TokenType.TOKEN_SLASH_EQUAL)) {
             expression();
 
-            final List<InlineField> clone = new ArrayList<>(inlineFields);
+            final List<BasaltField> clone = new ArrayList<>(inlineFields);
             Collections.reverse(clone);
 
-            Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            Optional<BasaltField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
             if (oInlineField.isPresent()) {
-                final InlineField inlineField = oInlineField.get();
+                final BasaltField inlineField = oInlineField.get();
                 convertLastStackForType(inlineField.type);
 
                 emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
@@ -1533,30 +1429,21 @@ public class Compiler {
                 return;
             }
 
-            convertLastStackForType(localType = localType.convertToPrimitiveIfPossible());
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
+
+            convertLastStackForType(local.type);
             notifyPopStack();
 
-            if (isPointer) {
-                dereference(local);
-                notifyPopStack();
-            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ILOAD), local.index));
-            notifyPushStack(localType);
-            emit(new InsnNode(peekLastStack().getOpcode(Opcodes.IDIV)));
-
-            if (isPointer) {
-                convertLastStackForType(localType);
-
-                emit(new VarInsnNode(Opcodes.ALOAD, local.index));
-                notifyPushStack(local.type);
-                reference();
-            } else emit(new VarInsnNode(localType.getOpcode(Opcodes.ISTORE), local.index));
+            emit(new InsnNode(local.type.getOpcode(Opcodes.IDIV)));
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ISTORE), local.index));
         } else {
             if (check(TokenType.TOKEN_LEFT_PAREN) && local == null) {
                 if (inlineMethods.stream().noneMatch(x -> x.name.equals(identifier))) {
                     notifyPushCallStack(new MethodCall(
                             -1,
                             getCurrentClass().name,
-                            Objects.requireNonNullElse(methodNameReplacements.get(identifier), identifier)
+                            Objects.requireNonNullElse(methodNameReplacements.get(identifier), identifier),
+                            false
                     ));
 
                     return;
@@ -1569,13 +1456,13 @@ public class Compiler {
             }
 
             if (classNameReplacements.containsKey(identifier)) {
-                final String rep = classNameReplacements.get(identifier).replace("/", ".");
+                final String rep = classNameReplacements.get(identifier);
 
-                Type repClass = null;
+                Type repClass;
                 try {
-                    if (rep.equals(currentClass))
-                        repClass = Type.getType(Class.forName(rep, true, runner));
-                    else repClass = Type.getType("L" + getCurrentClass().name + ";");
+                    if (rep.equals(getCurrentClass().name))
+                        repClass = Type.getType(Class.forName(rep.replace("/", "."), true, runner));
+                    else repClass = Type.getType("L" + rep + ";");
                 } catch (ClassNotFoundException e) {
                     e.printStackTrace();
                     return;
@@ -1583,12 +1470,12 @@ public class Compiler {
 
                 notifyPushTypeStack(repClass);
             } else if (!check(TokenType.TOKEN_LEFT_PAREN)) {
-                final List<InlineField> clone = new ArrayList<>(inlineFields);
+                final List<BasaltField> clone = new ArrayList<>(inlineFields);
                 Collections.reverse(clone);
 
-                Optional<InlineField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+                Optional<BasaltField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
                 if (oInlineField.isPresent()) {
-                    final InlineField inlineField = oInlineField.get();
+                    final BasaltField inlineField = oInlineField.get();
                     emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
                     notifyPushStack(inlineField.type);
                     return;
@@ -1681,7 +1568,7 @@ public class Compiler {
                 continue;
             if (method.getAnnotation(Inline.class) == null)
                 continue;
-            inlineMethods.add(new InlineMethod(type.replace(".", "/"), method.getName(), Type.getMethodDescriptor(method)));
+            inlineMethods.add(new BasaltMethod(type.replace(".", "/"), method.getName(), Type.getMethodDescriptor(method)));
         }
 
         for (Field field : clazz.getFields()) {
@@ -1689,7 +1576,7 @@ public class Compiler {
                 continue;
             if (field.getAnnotation(Inline.class) == null)
                 continue;
-            inlineFields.add(new InlineField(type.replace(".", "/"), field.getName(), Type.getType(field.getType())));
+            inlineFields.add(new BasaltField(type.replace(".", "/"), field.getName(), Type.getType(field.getType())));
         }
 
         classNameReplacements.put(clazz.getSimpleName(), type.replace(".", "/"));
@@ -1805,12 +1692,6 @@ public class Compiler {
     public void specialDot(boolean canAssign) {
         consume(TokenType.TOKEN_IDENTIFIER, "Expected identifier after \":\"!");
         final String content = parser.getPrevious().content();
-
-        if (peekLastStack() != null && peekLastStack().equals(StackTypes.POINTER_TYPE)) {
-            error("Can't apply \":\" to pointers!");
-
-            return;
-        }
 
         consume(TokenType.TOKEN_LEFT_PAREN, "Expected \"(\" after \"" + content + "\"!");
         final Pair<AbstractInsnNode[], Object> insns = captureInstructions(Compiler::argumentList);
@@ -2343,13 +2224,32 @@ public class Compiler {
             return;
         }
 
-        final String name;
+        Type extendingType = null;
+        ExtensionType extensionType = null;
+
+        String name;
         if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC))
             name = MAGIC_PREFIX + parseIdentifier("Expected name of magic method!");
         else {
-            if (!match(TokenType.TOKEN_IDENTIFIER))
+            if (!check(TokenType.TOKEN_IDENTIFIER))
                 name = "<init>";
-            else name = parser.getPrevious().content();
+            else {
+                name = parseType(null);
+
+                if (match(TokenType.TOKEN_COLON)) {
+                    extendingType = Type.getType(name);
+                    extensionType = modifiersForNextElement.contains(TokenType.TOKEN_STATIC)
+                            ? ExtensionType.CLASS : ExtensionType.INSTANCE;
+                    name = parseIdentifier("Expected extending method name!");
+
+                    annotationsForNextElement.add(createExtensionAnnotation(extensionType, extendingType));
+                    modifiersForNextElement.add(TokenType.TOKEN_STATIC);
+                } else if (name.contains("/")) {
+                    error("Invalid method name!");
+
+                    return;
+                }
+            }
         }
 
         if (modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
@@ -2366,36 +2266,30 @@ public class Compiler {
         final LabelNode start = new LabelNode();
         compiler.emit(start);
 
+        boolean isInstanceExtension = extendingType != null && extensionType == ExtensionType.INSTANCE;
+
         boolean isMethodStatic = !modifiersForNextElement.isEmpty() && modifiersForNextElement.contains(TokenType.TOKEN_STATIC);
-        if (!isMethodStatic) {
-            final Type thisType = Type.getType("L" + getCurrentClass().name + ";");
+        if (!isMethodStatic || isInstanceExtension) {
+            final Type thisType = isInstanceExtension ? extendingType : Type.getType("L" + getCurrentClass().name + ";");
             compiler.locals.put("this", new Local(thisType, 0, start));
 
             compiler.maxLocals += thisType.getSize();
         }
 
         final List<Type> parameters = new ArrayList<>();
+        if (isInstanceExtension)
+            parameters.add(extendingType);
+
         if (!check(TokenType.TOKEN_RIGHT_PAREN)) {
             do {
-                boolean pointer = match(TokenType.TOKEN_STAR);
                 String arg = parseIdentifier("Expected parameter name");
                 String typeName = consumeType("Expected type after parameter name");
                 String generics = parseGenericType();
                 Type type = Type.getType(typeName);
                 type.nullable = match(TokenType.TOKEN_QMARK);
-                if (pointer && type.nullable) {
-                    error("A pointer can not be nullable!");
 
-                    return;
-                }
-
-                Type baseType = Type.getType(typeName);
-                if (pointer)
-                    baseType = baseType.primitiveToObject();
-                type = pointer ? StackTypes.POINTER_TYPE : baseType;
-                String signature = baseType.getDescriptor().replace(";", "") + generics + ";";
-                signature = pointer ? ("L" + type.getInternalName() + "<" + signature + ">;") : signature;
-                type.signature = signature;
+                type = Type.getType(typeName);
+                type.signature = type.getDescriptor().replace(";", "") + generics + ";";
 
                 parameters.add(type);
 
@@ -2419,6 +2313,17 @@ public class Compiler {
         if (!Modifier.isPrivate(methodNode.access))
             methodNode.access |= Opcodes.ACC_PUBLIC;
         methodNode.desc = Type.getMethodDescriptor(type, parameters.toArray(Type[]::new));
+
+        if (extendingType != null) {
+            if (isMethodStatic)
+                MapUtils.putIntoList(staticExtensionMethods,
+                        extendingType.getInternalName(),
+                        new BasaltMethod(getCurrentClass().name, name, methodNode.desc));
+            else MapUtils.putIntoList(extensionMethods,
+                    extendingType.getInternalName(),
+                    new BasaltMethod(getCurrentClass().name, name, methodNode.desc));
+        }
+
         if (constructor) {
             if (methodNode.desc.equals("()V")) {
                 methodNode = getCurrentClass().methods.get(0);
@@ -2500,30 +2405,19 @@ public class Compiler {
         final List<Type> locals = new ArrayList<>();
         if (!check(TokenType.TOKEN_RIGHT_PAREN)) {
             do {
-                boolean pointer = match(TokenType.TOKEN_STAR);
                 String arg = parseIdentifier("Expected parameter name");
                 String typeName = consumeType("Expected type after parameter name");
                 String generics = parseGenericType();
                 Type type = Type.getType(typeName);
                 type.nullable = match(TokenType.TOKEN_QMARK);
-                if (pointer && type.nullable) {
-                    error("A pointer can not be nullable!");
 
-                    return;
-                }
-
-                Type baseType = Type.getType(typeName);
-                if (pointer)
-                    baseType = baseType.primitiveToObject();
-                type = pointer ? StackTypes.POINTER_TYPE : baseType;
-                String signature = baseType.getDescriptor().replace(";", "") + generics + ";";
-                signature = pointer ? ("L" + type.getInternalName() + "<" + signature + ">;") : signature;
-                type.signature = signature;
+                type = Type.getType(typeName);
+                type.signature = type.getDescriptor().replace(";", "") + generics + ";";
 
                 locals.add(type);
 
                 compiler.locals.put(arg, new Local(type, compiler.maxLocals, start));
-                compiler.maxLocals += type.getSize();;
+                compiler.maxLocals += type.getSize();
             } while (match(TokenType.TOKEN_COMMA));
         }
 
@@ -2592,31 +2486,20 @@ public class Compiler {
                 emitToInit(new VarInsnNode(Opcodes.ALOAD, 0));
         }
 
-        boolean pointer = match(TokenType.TOKEN_STAR);
         String name = parseIdentifier("Expect variable name.");
 
         boolean inference = !match(TokenType.TOKEN_COLON);
 
         Pair<String, String> typeName;
         Type type = null;
-        Type baseType = null;
         boolean nullable = false;
         String signature = null;
 
         if (!inference) {
             typeName = new Pair<>(parseType("Expected type name after \":\"."), parseGenericType());
-            baseType = Type.getType(typeName.k);
-            if (pointer)
-                baseType = baseType.primitiveToObject();
-            type = pointer ? StackTypes.POINTER_TYPE : baseType;
-            signature = baseType.getDescriptor().replace(";", "") + typeName.v + ";";
-            signature = pointer ? ("L" + type.getInternalName() + "<" + signature + ">;") : signature;
+            type = Type.getType(typeName.k);
+            signature = type.getDescriptor().replace(";", "") + typeName.v + ";";
             nullable = match(TokenType.TOKEN_QMARK);
-            if (pointer && nullable) {
-                error("A pointer can not be nullable!");
-
-                return;
-            }
             type.nullable = nullable;
         } else {
             if (!check(TokenType.TOKEN_EQUAL)) {
@@ -2637,12 +2520,7 @@ public class Compiler {
 
             if (!inference) {
                 if (!peekLastStack().nullable) {
-                    convertLastStackForType(baseType);
-                }
-                if (pointer) {
-                    convertLastStackToObject();
-                    emit(new MethodInsnNode(Opcodes.INVOKESTATIC, "basalt/lang/Pointer", "of", "(Ljava/lang/Object;)Lbasalt/lang/Pointer;"));
-                    notifyReplaceLastStack(type);
+                    convertLastStackForType(type);
                 }
             } else type = peekLastStack();
 
@@ -3079,6 +2957,7 @@ public class Compiler {
 
     public byte[] compileToByteArray(String source) {
         compile(source);
+
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
             @Override
             protected String getCommonSuperClass(String type1, String type2) {
