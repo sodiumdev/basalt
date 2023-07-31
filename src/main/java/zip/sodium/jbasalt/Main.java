@@ -39,7 +39,7 @@ public class Main {
         }
     }
 
-    private static final File outDir;
+    public static final File outDir;
     public static final File inDir;
 
     public static final File jarDir;
@@ -77,21 +77,25 @@ public class Main {
             filePackage = filePackage.substring(1);
         } catch (IndexOutOfBoundsException ignored) {}
 
-        File outDir = new File(Main.outDir, filePackage);
-        outDir.mkdirs();
-
         final Compiler compiler = new Compiler(filePackage.replace("\\", "."), f.getName(), runner);
 
         try (FileInputStream din = new FileInputStream(f)) {
             compiler.compileToEphemeralRunner(new String(din.readAllBytes()));
         }
 
-        try (FileOutputStream dout = new FileOutputStream(new File(outDir, FilenameUtils.removeExtension(f.getName()) + ".class"))) {
+        final File out = new File(outDir, filePackage);
+        out.mkdirs();
+
+        try (FileOutputStream dout = new FileOutputStream(new File(out, FilenameUtils.removeExtension(f.getName()) + ".class"))) {
             dout.write(runner.classes.get(filePackage.replace("\\", ".") + "." + FilenameUtils.removeExtension(f.getName())));
         }
 
         for (InnerClassNode innerClass : compiler.getCurrentClass().innerClasses) {
-            try (FileOutputStream dout = new FileOutputStream(new File(outDir, compiler.currentClass + "$" + innerClass.innerName + ".class"))) {
+            File file = new File(outDir, innerClass.name + ".class");
+            file.getParentFile().mkdirs();
+            file.createNewFile();
+
+            try (FileOutputStream dout = new FileOutputStream(file)) {
                 ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
                     @Override
                     protected String getCommonSuperClass(String type1, String type2) {
@@ -101,7 +105,7 @@ public class Main {
                         return super.getCommonSuperClass(type1, type2);
                     }
                 };
-                Compiler.classes.get(compiler.currentClass + "$" + innerClass.innerName).accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                Compiler.classes.get(innerClass.name).accept(new ClassVisitor(Opcodes.ASM9, cw) {
                     @Override
                     public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
                         // The InstructionAdapter correct some op codes to more optimized alternatives.
@@ -140,8 +144,6 @@ public class Main {
 
         for (File f : files)
             compileFile(runner, f);
-
-        // jarFile();
 
         if (args.length >= 1)
             runner.run(args[0], Arrays.copyOfRange(args, 1, args.length));

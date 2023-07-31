@@ -17,6 +17,7 @@ public class EphemeralRunner extends ClassLoader {
     private final Map<String, Class<?>> emulatedClassInstances = new HashMap<>();
 
     private CompileFunction compileFunction;
+    private String packageName;
 
     public EphemeralRunner(ClassLoader parent) {
         super(parent);
@@ -25,6 +26,16 @@ public class EphemeralRunner extends ClassLoader {
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
         if (!classes.containsKey(name)) {
+            if (name.startsWith(packageName)) {
+                try {
+                    compileFunction.apply(this, new File(Main.inDir, name.replace(".", "/") + ".bas"));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+
+                return findClass(name);
+            }
+
             return super.findClass(name);
         }
 
@@ -56,6 +67,7 @@ public class EphemeralRunner extends ClassLoader {
     }
 
     public void setCompiler(Compiler compiler) {
+        this.packageName = compiler.filePackage;
     }
 
     public void setCompileFunction(CompileFunction compileFunction) {

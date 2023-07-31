@@ -4,7 +4,11 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.commons.InstructionAdapter;
 
+import java.util.Iterator;
+
 public final class StackTypes {
+    public static final Type ITERATOR = Type.getType(Iterator.class);
+
     private StackTypes() {
         throw new AssertionError("Cannot instantiate StackTypes!");
     }

@@ -23,6 +23,7 @@ public class Scanner {
         keywords.put("if",     TokenType.TOKEN_IF);
         keywords.put("null",   TokenType.TOKEN_NULL);
         keywords.put("or",     TokenType.TOKEN_OR);
+        keywords.put("in",     TokenType.TOKEN_IN);
         keywords.put("return", TokenType.TOKEN_RETURN);
         keywords.put("true",   TokenType.TOKEN_TRUE);
         keywords.put("let",    TokenType.TOKEN_LET);
@@ -34,6 +35,10 @@ public class Scanner {
         keywords.put("final",  TokenType.TOKEN_FINAL);
         keywords.put("private",TokenType.TOKEN_PRIVATE);
         keywords.put("magic",  TokenType.TOKEN_MAGIC);
+        keywords.put("enum",   TokenType.TOKEN_ENUM);
+        keywords.put("trait",  TokenType.TOKEN_TRAIT);
+        keywords.put("setter", TokenType.TOKEN_SETTER);
+        keywords.put("getter", TokenType.TOKEN_GETTER);
     }
 
     public Scanner() {}

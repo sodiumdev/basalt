@@ -1,8 +1,7 @@
  package zip.sodium.jbasalt.compiler;
 
-import basalt.lang.ExtensionType;
-import basalt.lang.Inline;
-import basalt.lang.MapUtils;
+import basalt.lang.*;
+import org.apache.commons.lang3.StringUtils;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.objectweb.asm.*;
@@ -41,6 +40,15 @@ public class Compiler {
         return extensionAnnotation;
     }
 
+    private static AnnotationNode createPropertyAnnotation(PropertyType type, Type propertyType) {
+        final AnnotationNode propertyAnnotation = new AnnotationNode("Lbasalt/lang/Property;");
+
+        propertyAnnotation.visitEnum("type", "Lbasalt/lang/PropertyType;", type.name());
+        propertyAnnotation.visit("propertyType", propertyType);
+
+        return propertyAnnotation;
+    }
+
     private CompilerType type;
     public Parser parser;
     public Scanner scanner;
@@ -62,7 +70,6 @@ public class Compiler {
     public static Map<String, ClassNode> classes = new HashMap<>();
 
     public String currentClass;
-    public String parentClass;
 
     public int currentMethod;
 
@@ -86,6 +93,7 @@ public class Compiler {
 
     private final List<BasaltMethod> inlineMethods = new ArrayList<>();
     private final List<BasaltField> inlineFields = new ArrayList<>();
+
 
     /**
      * - {@link #callStack}
@@ -134,12 +142,15 @@ public class Compiler {
         rules.put(TokenType.TOKEN_WHILE, ParseRule.NULL);
         rules.put(TokenType.TOKEN_IF, ParseRule.NULL);
         rules.put(TokenType.TOKEN_ELSE, ParseRule.NULL);
+        rules.put(TokenType.TOKEN_FOR, ParseRule.NULL);
 
         rules.put(TokenType.TOKEN_STATIC, ParseRule.NULL);
         rules.put(TokenType.TOKEN_PRIVATE, ParseRule.NULL);
         rules.put(TokenType.TOKEN_FINAL, ParseRule.NULL);
         rules.put(TokenType.TOKEN_MAGIC, ParseRule.NULL);
         rules.put(TokenType.TOKEN_INLINE, ParseRule.NULL);
+        rules.put(TokenType.TOKEN_SETTER, ParseRule.NULL);
+        rules.put(TokenType.TOKEN_GETTER, ParseRule.NULL);
 
         rules.put(TokenType.TOKEN_QDOT, new ParseRule(null, Compiler::qDot, Precedence.PREC_CALL));
         rules.put(TokenType.TOKEN_ELVIS, new ParseRule(null, Compiler::elvis, Precedence.PREC_CALL));
@@ -179,7 +190,7 @@ public class Compiler {
     private enum CompilerType {
         TOP,
         CLASS, METHOD,
-        NESTED_CLASS, NESTED_METHOD,
+        NESTED_METHOD,
     }
 
     public Compiler(String filePackage, String fileName, EphemeralRunner runner) {
@@ -199,9 +210,7 @@ public class Compiler {
         parser = parent.parser;
         scanner = parent.scanner;
 
-        if (type != CompilerType.NESTED_CLASS)
-            currentClass = parent.currentClass;
-        else parentClass = parent.currentClass;
+        currentClass = parent.currentClass;
 
         runner = parent.runner;
         fileName = parent.fileName;
@@ -435,13 +444,10 @@ public class Compiler {
     public void parsePrecedence(Precedence precedence) {
         advance();
         BiConsumer<Compiler, Boolean> prefixRule = getRule(parser.getPrevious().type()).prefixRule();
-        if (prefixRule == null) {
-            error("Expected expression, but got \"" + parser.getPrevious().content() + "\" instead");
-            return;
-        }
 
         boolean canAssign = precedence.ordinal() <= Precedence.PREC_ASSIGNMENT.ordinal();
         prefixRule.accept(this, canAssign);
+
         if (parser.hadError())
             System.exit(-1);
 
@@ -458,7 +464,14 @@ public class Compiler {
     }
 
     public ParseRule getRule(TokenType type) {
-        return rules.get(type);
+        ParseRule rule = rules.get(type);
+
+        if (rule == null) {
+            error("Expected expression, but got \"" + parser.getCurrent().content() + "\" instead");
+            return null;
+        }
+
+        return rule;
     }
 
     public void cast(boolean canAssign) {
@@ -691,6 +704,7 @@ public class Compiler {
             internalType = StackTypes.getTypeFromClassName(arrayType);
         }
 
+
         final AtomicInteger arraySize = new AtomicInteger(0);
         final Type finalInternalType = internalType;
         Pair<AbstractInsnNode[], Object> abstractInsnNodes = captureInstructions(compiler -> {
@@ -887,16 +901,21 @@ public class Compiler {
         if (canAssign && match(TokenType.TOKEN_EQUAL)) {
             expression();
 
-            emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
-                    "java/util/HashMap", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+            convertLastStackToObject();
+            convertLastStackToObject();
+
+            emit(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
+                    "java/util/Map", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
                     new InsnNode(Opcodes.POP));
 
             notifyPopStack();
             notifyPopStack();
             notifyPopStack();
         } else {
-            emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
-                            "java/util/HashMap", "get", "(Ljava/lang/Object;)Ljava/lang/Object;"));
+            convertLastStackToObject();
+
+            emit(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
+                            "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;"));
 
             notifyPopStack();
             notifyReplaceLastStack(StackTypes.OBJECT_TYPE);
@@ -960,7 +979,7 @@ public class Compiler {
             }
     }
 
-    public Class<?> typeToClass(Type type) {
+    public Class<?> typeToClass(@NotNull Type type) {
         try {
             if (type.getSort() != Type.OBJECT)
                 return PRIMITIVE_TYPES.get(type.getSort());
@@ -1135,37 +1154,14 @@ public class Compiler {
         emit(new InsnNode(Opcodes.DUP));
         emit(new JumpInsnNode(Opcodes.IFNULL, l2));
 
-        if (!match(TokenType.TOKEN_LEFT_PAREN)) {
-            if (peekLastTypeStack() != null) try {
-                final Type fieldType = findFieldType(peekLastTypeStack(), afterDot);
+        boolean assign = canAssign && match(TokenType.TOKEN_EQUAL);
+        if (assign)
+            dotAssign(afterDot);
+        else dotGet(afterDot);
 
-                emit(new FieldInsnNode(Opcodes.GETSTATIC, peekLastTypeStack().getInternalName(), afterDot, fieldType.getDescriptor()));
-                notifyPushStack(fieldType);
-            } catch (ClassNotFoundException | NoSuchFieldException e) {
-                error("Couldn't find field!");
-            } else try {
-                final Type fieldType = findFieldType(peekLastStack(), afterDot);
-
-                emit(new FieldInsnNode(Opcodes.GETFIELD, notifyPopStack().getInternalName(), afterDot, fieldType.getDescriptor()));
-                notifyPushStack(fieldType);
-            } catch (ClassNotFoundException | NoSuchFieldException e) {
-                error("Couldn't find field!");
-            }
-
-            emit(new JumpInsnNode(Opcodes.GOTO, l3));
-            emit(l2, new InsnNode(Opcodes.POP),
-                    new InsnNode(Opcodes.ACONST_NULL));
-            emit(l3);
-
-            return;
-        }
-
-        if (peekLastTypeStack() != null)
-            notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot, false));
-        else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot, false));
-
-        call(false);
-        convertLastStackToObject();
+        if (!callStack.isEmpty())
+            call(false);
+        if (!assign) convertLastStackToObject();
 
         emit(new JumpInsnNode(Opcodes.GOTO, l3));
         emit(l2, new InsnNode(Opcodes.POP),
@@ -1173,68 +1169,142 @@ public class Compiler {
         emit(l3);
     }
 
+    private void dotAssign(String afterDot) {
+        expression();
+
+        if (peekLastTypeStack() != null) try {
+            final Type fieldType = findFieldType(peekLastTypeStack(), afterDot);
+
+            emit(new FieldInsnNode(Opcodes.PUTSTATIC, notifyPopTypeStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+        } catch (ClassNotFoundException | NoSuchFieldException e) {
+            Optional<Method> method = Arrays.stream(typeToClass(peekLastTypeStack()).getMethods())
+                    .filter(x -> Modifier.isStatic(x.getModifiers())
+                            && x.getName().equals(afterDot)
+                            && x.getParameterCount() == 1
+                            && x.getAnnotation(Property.class) != null
+                            && x.getAnnotation(Property.class).type() == PropertyType.SET).findAny();
+
+            if (method.isPresent()) {
+                final Type type = Type.getType(method.get().getAnnotation(Property.class).propertyType());
+                convertLastStackForType(type);
+
+                emit(new MethodInsnNode(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot, Type.getMethodDescriptor(StackTypes.VOID, type)));
+            } else error("Couldn't find field \"" + afterDot + "\"!");
+        } finally {
+            notifyPopStack();
+        } else try {
+            final Type fieldType = findFieldType(peekPreviousLastStack(), afterDot);
+
+            emit(new FieldInsnNode(Opcodes.PUTFIELD, peekPreviousLastStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+        } catch (ClassNotFoundException | NoSuchFieldException e) {
+            Optional<Method> method = Arrays.stream(typeToClass(peekPreviousLastStack()).getMethods())
+                    .filter(x -> !Modifier.isStatic(x.getModifiers())
+                            && x.getName().equals(afterDot)
+                            && x.getParameterCount() == 1
+                            && x.getAnnotation(Property.class) != null
+                            && x.getAnnotation(Property.class).type() == PropertyType.SET).findAny();
+
+            if (method.isPresent()) {
+                final Type type = Type.getType(method.get().getAnnotation(Property.class).propertyType());
+                convertLastStackForType(type);
+
+                emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, peekPreviousLastStack().getInternalName(), afterDot, Type.getMethodDescriptor(StackTypes.VOID, type)));
+            } else error("Couldn't find field \"" + afterDot + "\"!");
+        } finally {
+            notifyPopStack();
+            notifyPopStack();
+        }
+    }
+
+    private void dotGet(String afterDot) {
+        if (!check(TokenType.TOKEN_LEFT_PAREN)) {
+            if (peekLastTypeStack() != null) try {
+                final Type fieldType = findFieldType(peekLastTypeStack(), afterDot);
+
+                emit(new FieldInsnNode(Opcodes.GETSTATIC, notifyPopTypeStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+                notifyPushStack(fieldType);
+            } catch (ClassNotFoundException | NoSuchFieldException e) {
+                Optional<Method> method = Arrays.stream(typeToClass(peekLastTypeStack()).getMethods())
+                        .filter(x -> !Modifier.isStatic(x.getModifiers())
+                                && x.getName().equals(afterDot)
+                                && x.getReturnType() != void.class
+                                && x.getAnnotation(Property.class) != null
+                                && x.getAnnotation(Property.class).type() == PropertyType.GET).findAny();
+
+                if (method.isPresent()) {
+                    final Type type = Type.getType(method.get().getAnnotation(Property.class).propertyType());
+
+                    emit(new MethodInsnNode(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot, Type.getMethodDescriptor(type)));
+                    notifyPushStack(type);
+                } else error("Couldn't find field \"" + afterDot + "\"!");
+            } else try {
+                final Type fieldType = findFieldType(peekLastStack(), afterDot);
+
+                emit(new FieldInsnNode(Opcodes.GETFIELD, notifyPopStack().getInternalName(), afterDot, fieldType.getDescriptor()));
+                notifyPushStack(fieldType);
+            } catch (ClassNotFoundException | NoSuchFieldException e) {
+                Optional<Method> method = Arrays.stream(typeToClass(peekLastStack()).getMethods())
+                        .filter(x -> !Modifier.isStatic(x.getModifiers())
+                                && x.getName().equals(afterDot)
+                                && x.getReturnType() != void.class
+                                && x.getAnnotation(Property.class) != null
+                                && x.getAnnotation(Property.class).type() == PropertyType.GET).findAny();
+
+                if (method.isPresent()) {
+                    final Type type = Type.getType(method.get().getAnnotation(Property.class).propertyType());
+
+                    emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot, Type.getMethodDescriptor(type)));
+                    notifyPushStack(type);
+                } else error("Couldn't find field \"" + afterDot + "\"!");
+            }
+
+            return;
+        }
+
+        if (peekLastTypeStack() != null) {
+            if (staticExtensionMethods.containsKey(peekLastTypeStack().getInternalName())) {
+                BasaltMethod method = staticExtensionMethods.get(peekLastTypeStack().getInternalName())
+                        .stream()
+                        .filter(x -> x.name.equals(afterDot)).findAny().orElseGet(() -> {
+                            notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, peekLastTypeStack().getInternalName(), afterDot, false));
+
+                            return null;
+                        });
+
+                notifyPopTypeStack();
+
+                if (method == null)
+                    return;
+
+                notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, method.owner, method.name, false));
+            } else notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot, false));
+        } else {
+            if (extensionMethods.containsKey(peekLastStack().getInternalName())) {
+                BasaltMethod method = extensionMethods.get(peekLastStack().getInternalName())
+                        .stream()
+                        .filter(x -> x.name.equals(afterDot)).findAny().orElseGet(() -> {
+                            notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, peekLastStack().getInternalName(), afterDot, false));
+
+                            return null;
+                        });
+
+                notifyPopStack();
+
+                if (method == null)
+                    return;
+
+                notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, method.owner, method.name, true));
+            } else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot, false));
+        }
+    }
+
     public void dot(boolean canAssign) {
         consume(TokenType.TOKEN_IDENTIFIER, "Expect property name!");
         final String afterDot = parser.getPrevious().content();
 
-        if (canAssign && match(TokenType.TOKEN_EQUAL)) {
-            expression();
-
-            if (peekLastTypeStack() != null) try {
-                final Type fieldType = findFieldType(peekLastTypeStack(), afterDot);
-
-                emit(new FieldInsnNode(Opcodes.PUTSTATIC, peekLastTypeStack().getInternalName(), afterDot, fieldType.getDescriptor()));
-            } catch (ClassNotFoundException | NoSuchFieldException e) {
-                error("Couldn't find field!");
-            } else try {
-                final Type fieldType = findFieldType(peekLastStack(), afterDot);
-
-                emit(new FieldInsnNode(Opcodes.PUTFIELD, notifyPopStack().getInternalName(), afterDot, fieldType.getDescriptor()));
-            } catch (ClassNotFoundException | NoSuchFieldException e) {
-                error("Couldn't find field!");
-            }
-
-            notifyPopStack();
-            notifyPopStack();
-        } else {
-            if (!check(TokenType.TOKEN_LEFT_PAREN)) {
-                if (peekLastTypeStack() != null) try {
-                    final Type fieldType = findFieldType(peekLastTypeStack(), afterDot);
-
-                    emit(new FieldInsnNode(Opcodes.GETSTATIC, peekLastTypeStack().getInternalName(), afterDot, fieldType.getDescriptor()));
-                    notifyPushStack(fieldType);
-                } catch (ClassNotFoundException | NoSuchFieldException e) {
-                    error("Couldn't find field!");
-                } else try {
-                    final Type fieldType = findFieldType(peekLastStack(), afterDot);
-
-                    emit(new FieldInsnNode(Opcodes.GETFIELD, notifyPopStack().getInternalName(), afterDot, fieldType.getDescriptor()));
-                    notifyPushStack(fieldType);
-                } catch (ClassNotFoundException | NoSuchFieldException e) {
-                    error("Couldn't find field!");
-                }
-
-                return;
-            }
-
-            if (peekLastTypeStack() != null) {
-                if (staticExtensionMethods.containsKey(peekLastTypeStack().getInternalName())) {
-                    BasaltMethod method = staticExtensionMethods.get(notifyPopTypeStack().getInternalName())
-                            .stream()
-                            .filter(x -> x.name.equals(afterDot)).findAny().orElseThrow();
-
-                    notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, method.owner, method.name, false));
-                } else notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, notifyPopTypeStack().getInternalName(), afterDot, false));
-            } else {
-                if (extensionMethods.containsKey(peekLastStack().getInternalName())) {
-                    BasaltMethod method = extensionMethods.get(notifyPopStack().getInternalName())
-                            .stream()
-                            .filter(x -> x.name.equals(afterDot)).findAny().orElseThrow();
-
-                    notifyPushCallStack(new MethodCall(Opcodes.INVOKESTATIC, method.owner, method.name, true));
-                } else notifyPushCallStack(new MethodCall(Opcodes.INVOKEVIRTUAL, notifyPopStack().getInternalName(), afterDot, false));
-            }
-        }
+        if (canAssign && match(TokenType.TOKEN_EQUAL))
+            dotAssign(afterDot);
+        else dotGet(afterDot);
     }
 
     public Type findFieldType(Type parentType, String name) throws ClassNotFoundException, NoSuchFieldException {
@@ -1490,12 +1560,12 @@ public class Compiler {
                 boolean isFieldStatic = isField && getCurrentClass().fields.stream()
                         .anyMatch(x -> (x.access & Opcodes.ACC_STATIC) == Opcodes.ACC_STATIC && Objects.equals(x.name, identifier));
 
-                if (local == null && type != CompilerType.CLASS && type != CompilerType.NESTED_CLASS && !isField) {
+                if (local == null && type != CompilerType.CLASS && !isField) {
                     errorAtCurrent("Variable \"" + identifier + "\" does not exist");
                     return;
                 }
 
-                if (isField && (type == CompilerType.CLASS || type == CompilerType.NESTED_CLASS)) {
+                if (isField && (type == CompilerType.CLASS)) {
                     final String desc = getCurrentClass().fields.stream()
                             .filter(x -> Objects.equals(x.name, identifier))
                             .findAny().orElseThrow().desc;
@@ -1505,6 +1575,11 @@ public class Compiler {
                     else emit(new FieldInsnNode(Opcodes.GETFIELD, getCurrentClass().name, identifier, desc));
                     notifyPushStack(Type.getType(desc));
                 } else {
+                    if (local == null) {
+                        error("Variable \"" + identifier + "\" does not exist");
+                        return;
+                    }
+
                     emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
                     notifyPushStack(local.type);
                 }
@@ -1563,6 +1638,7 @@ public class Compiler {
             clazz = Class.forName(type, true, runner);
         } catch (ClassNotFoundException e) {
             error("\"" + type + "\" is not a valid class!");
+            e.printStackTrace();
             return;
         }
 
@@ -1663,18 +1739,46 @@ public class Compiler {
         final Set<TokenType> modifiers = new HashSet<>();
 
         while (match(TokenType.TOKEN_INLINE, TokenType.TOKEN_PRIVATE, TokenType.TOKEN_STATIC,
-                TokenType.TOKEN_FINAL, TokenType.TOKEN_MAGIC)) {
+                TokenType.TOKEN_FINAL, TokenType.TOKEN_MAGIC, TokenType.TOKEN_SETTER, TokenType.TOKEN_GETTER)) {
             modifiers.add(parser.getPrevious().type());
         }
 
         switch (parser.getCurrent().type()) {
-            case TOKEN_FN, TOKEN_LET -> modifiersForNextElement.addAll(modifiers);
+            case TOKEN_FN -> modifiersForNextElement.addAll(modifiers);
+            case TOKEN_LET -> {
+                if (modifiers.contains(TokenType.TOKEN_GETTER)) {
+                    error("A variable can not be a getter!");
+
+                    return;
+                }
+
+                if (modifiers.contains(TokenType.TOKEN_SETTER)) {
+                    error("A variable can not be a setter!");
+
+                    return;
+                }
+
+                modifiersForNextElement.addAll(modifiers);
+            }
             case TOKEN_CLASS -> {
+                if (modifiers.contains(TokenType.TOKEN_GETTER)) {
+                    error("A class can not be a getter!");
+
+                    return;
+                }
+
+                if (modifiers.contains(TokenType.TOKEN_SETTER)) {
+                    error("A class can not be a setter!");
+
+                    return;
+                }
+
                 if (modifiers.contains(TokenType.TOKEN_MAGIC)) {
                     error("A class can not be magic!");
 
                     return;
                 }
+
                 if (modifiers.contains(TokenType.TOKEN_INLINE)) {
                     error("A class can not be inline!");
 
@@ -2058,6 +2162,11 @@ public class Compiler {
         return null;
     }
 
+    public Type peekPreviousLastTypeStack() {
+        int size = typeStack.size();
+        return size < 2 ? null : typeStack.get(size - 2);
+    }
+
     public Type peekLastTypeStack() {
         return typeStack.isEmpty() ? null : typeStack.peek();
     }
@@ -2223,37 +2332,65 @@ public class Compiler {
     }
 
     public void fnDeclaration() {
-        if (type != CompilerType.CLASS && type != CompilerType.NESTED_CLASS) {
+        if (type != CompilerType.CLASS) {
             errorAtCurrent("Methods can only be inside of classes!");
             return;
         }
 
+        boolean isInterface = (getCurrentClass().access & Opcodes.ACC_INTERFACE) == Opcodes.ACC_INTERFACE;
+
         Type extendingType = null;
         ExtensionType extensionType = null;
 
+        boolean isMethodTrulyStatic = !modifiersForNextElement.isEmpty() && modifiersForNextElement.contains(TokenType.TOKEN_STATIC);
+
         String name;
-        if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC))
+        if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC)) {
+            if (isInterface) {
+                error("Can't make magic methods in interfaces!");
+
+                return;
+            }
+
             name = MAGIC_PREFIX + parseIdentifier("Expected name of magic method!");
-        else {
+        } else {
             if (!check(TokenType.TOKEN_IDENTIFIER))
                 name = "<init>";
             else {
                 name = parseType(null);
+                String generics = parseGenericType();
 
                 if (match(TokenType.TOKEN_COLON)) {
+                    if (isInterface) {
+                        error("Can't make extension methods in interfaces!");
+
+                        return;
+                    }
+
                     extendingType = Type.getType(name);
+                    extendingType.signature = name.replace(";", "") + generics;
+                    if (extendingType.getSort() == Type.OBJECT)
+                        extendingType.signature += ";";
+
                     extensionType = modifiersForNextElement.contains(TokenType.TOKEN_STATIC)
                             ? ExtensionType.CLASS : ExtensionType.INSTANCE;
+
                     name = parseIdentifier("Expected extending method name!");
 
                     annotationsForNextElement.add(createExtensionAnnotation(extensionType, extendingType));
                     modifiersForNextElement.add(TokenType.TOKEN_STATIC);
-                } else if (name.contains("/")) {
+                } else if (name.contains("/") || !generics.isEmpty()) {
                     error("Invalid method name!");
 
                     return;
                 }
             }
+        }
+
+        if (modifiersForNextElement.contains(TokenType.TOKEN_GETTER) && modifiersForNextElement.contains(TokenType.TOKEN_SETTER)) {
+            error("A method can not be both a getter and a setter!");
+
+            return;
         }
 
         if (modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
@@ -2272,8 +2409,7 @@ public class Compiler {
 
         boolean isInstanceExtension = extendingType != null && extensionType == ExtensionType.INSTANCE;
 
-        boolean isMethodStatic = !modifiersForNextElement.isEmpty() && modifiersForNextElement.contains(TokenType.TOKEN_STATIC);
-        if (!isMethodStatic || isInstanceExtension) {
+        if (!isMethodTrulyStatic || isInstanceExtension) {
             final Type thisType = isInstanceExtension ? extendingType : Type.getType("L" + getCurrentClass().name + ";");
             compiler.locals.put("this", new Local(thisType, 0, start));
 
@@ -2293,7 +2429,9 @@ public class Compiler {
                 type.nullable = match(TokenType.TOKEN_QMARK);
 
                 type = Type.getType(typeName);
-                type.signature = type.getDescriptor().replace(";", "") + generics + ";";
+                type.signature = type.getDescriptor().replace(";", "") + generics;
+                if (type.getSort() == Type.OBJECT)
+                    type.signature += ";";
 
                 parameters.add(type);
 
@@ -2302,12 +2440,29 @@ public class Compiler {
             } while (match(TokenType.TOKEN_COMMA));
         }
 
+        if (modifiersForNextElement.contains(TokenType.TOKEN_SETTER) && parameters.size() != 1) {
+            error("Missing required one parameter of type in setter methods!");
+
+            return;
+        }
+
         consume(TokenType.TOKEN_RIGHT_PAREN, "Expected \")\" after parameters!");
 
         Type type = StackTypes.VOID;
+        if (isInterface && !check(TokenType.TOKEN_COLON)) {
+            error("Expected return type!");
+
+            return;
+        }
         if (!constructor && check(TokenType.TOKEN_COLON)) {
             type = Type.getType(consumeType("Expected return type after \":\"!"));
             type.nullable = match(TokenType.TOKEN_QMARK);
+        }
+
+        if (modifiersForNextElement.contains(TokenType.TOKEN_SETTER) && !type.equals(StackTypes.VOID)) {
+            error("Missing required return type in getter methods!");
+
+            return;
         }
 
         MethodNode methodNode = compiler.getCurrentMethod(true);
@@ -2317,13 +2472,15 @@ public class Compiler {
         if (!Modifier.isPrivate(methodNode.access))
             methodNode.access |= Opcodes.ACC_PUBLIC;
         methodNode.desc = Type.getMethodDescriptor(type, parameters.toArray(Type[]::new));
+        if (isInterface)
+            methodNode.access |= Opcodes.ACC_ABSTRACT;
 
         if (extendingType != null) {
-            if (isMethodStatic)
-                MapUtils.putIntoList(staticExtensionMethods,
+            if (isMethodTrulyStatic)
+                Utils.putIntoListInMap(staticExtensionMethods,
                         extendingType.getInternalName(),
                         new BasaltMethod(getCurrentClass().name, name, methodNode.desc));
-            else MapUtils.putIntoList(extensionMethods,
+            else Utils.putIntoListInMap(extensionMethods,
                     extendingType.getInternalName(),
                     new BasaltMethod(getCurrentClass().name, name, methodNode.desc));
         }
@@ -2341,6 +2498,11 @@ public class Compiler {
             compiler.currentMethod = 0;
         }
 
+        if (modifiersForNextElement.contains(TokenType.TOKEN_GETTER))
+            annotationsForNextElement.add(createPropertyAnnotation(PropertyType.GET, type));
+        else if (modifiersForNextElement.contains(TokenType.TOKEN_SETTER))
+            annotationsForNextElement.add(createPropertyAnnotation(PropertyType.SET, parameters.get(0)));
+
         modifiersForNextElement.clear();
 
         methodNode.visibleAnnotations = new ArrayList<>(annotationsForNextElement);
@@ -2353,7 +2515,9 @@ public class Compiler {
             compiler.emit(new VarInsnNode(Opcodes.ALOAD, 0),
                     new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V"));
 
-        if (match(TokenType.TOKEN_LEFT_BRACE)) {
+        if (isInterface)
+            match(TokenType.TOKEN_SEMICOLON);
+        else if (match(TokenType.TOKEN_LEFT_BRACE)) {
             while (!check(TokenType.TOKEN_RIGHT_BRACE) && !check(TokenType.TOKEN_EOF)) {
                 compiler.declarationInMethod(name);
             }
@@ -2365,7 +2529,7 @@ public class Compiler {
         final LabelNode end = new LabelNode();
         compiler.emit(end);
 
-        if (type.equals(StackTypes.VOID) && !constructor)
+        if (type.equals(StackTypes.VOID) && !constructor && !isInterface)
             compiler.emitVoidReturn();
 
         for (Map.Entry<String, Local> entry : compiler.locals.entrySet()) {
@@ -2416,7 +2580,9 @@ public class Compiler {
                 type.nullable = match(TokenType.TOKEN_QMARK);
 
                 type = Type.getType(typeName);
-                type.signature = type.getDescriptor().replace(";", "") + generics + ";";
+                type.signature = type.getDescriptor().replace(";", "") + generics;
+                if (type.getSort() == Type.OBJECT)
+                    type.signature += ";";
 
                 locals.add(type);
 
@@ -2473,6 +2639,91 @@ public class Compiler {
         getCurrentClass().methods.add(methodNode);
     }
 
+    public void unpack(LabelNode start, String name, int index, Type lastStack) {
+        Class<?> type = typeToClass(lastStack);
+
+        emit(new InsnNode(Opcodes.DUP));
+
+        if (Map.class.isAssignableFrom(type))
+            unpackMap(name);
+        else if (type.isAssignableFrom(List.class))
+            unpackList(lastStack, index);
+        else if (type.isArray())
+            unpackArray(lastStack, index);
+        else if (lastStack.getSort() == Type.OBJECT) {
+            unpackObject(lastStack, name);
+        } else error("Can't unpack primitives!");
+
+        Type vartype = peekLastStack();
+
+        Local local = new Local(vartype, maxLocals, start);
+        maxLocals += vartype.getSize();
+        emit(new VarInsnNode(vartype.getOpcode(Opcodes.ISTORE), local.index));
+
+        locals.put(name, local);
+    }
+
+    private void unpackObject(Type lastStack, String name) {
+        try {
+            final Type fieldType = findFieldType(lastStack, name);
+
+            emit(new FieldInsnNode(Opcodes.GETFIELD, lastStack.getInternalName(), name, fieldType.getDescriptor()));
+            notifyPushStack(fieldType);
+        } catch (ClassNotFoundException | NoSuchFieldException e) {
+            Optional<Method> method = Arrays.stream(typeToClass(lastStack).getMethods())
+                    .filter(x -> !Modifier.isStatic(x.getModifiers())
+                            && x.getName().equals(name)
+                            && x.getReturnType() != void.class
+                            && x.getAnnotation(Property.class) != null
+                            && x.getAnnotation(Property.class).type() == PropertyType.GET).findAny();
+
+            if (method.isPresent()) {
+                final Type type = Type.getType(method.get().getAnnotation(Property.class).propertyType());
+
+                emit(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, lastStack.getInternalName(), name, Type.getMethodDescriptor(type)));
+                notifyPushStack(type);
+            } else error("Couldn't find field \"" + name + "\"!");
+        }
+    }
+
+    private void unpackArray(Type lastStack, int index) {
+        Type type = Type.getType(StringUtils.replaceOnce(lastStack.getDescriptor(), "[", ""));
+
+        emitConstant(index);
+        emit(new InsnNode(type.getOpcode(Opcodes.IALOAD)));
+
+        notifyReplaceLastStack(type);
+    }
+
+    public void unpackList(Type lastStack, int index) {
+        List<Type> types = getSignatureTypes(lastStack);
+
+        emitConstant(index);
+        emit(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
+                "java/util/List", "get", "(I)Ljava/lang/Object;"));
+
+        notifyReplaceLastStack(types.get(0));
+    }
+
+    public static List<Type> getSignatureTypes(Type lastStack) {
+        String sigType = StringUtils.replaceOnce(
+                lastStack.signature,
+                lastStack.getDescriptor(),
+                ""
+        );
+        sigType = sigType.substring(1, sigType.length() - 2);
+
+        return Arrays.stream(StringUtils.split(sigType, ',')).map(String::strip).map(Type::getType).toList();
+    }
+
+    public void unpackMap(String name) {
+        emitConstant(name);
+        emit(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
+                "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;"));
+
+        notifyReplaceLastStack(StackTypes.OBJECT_TYPE);
+    }
+
     public void varDeclaration(boolean semicolon) {
         clearStack();
 
@@ -2483,14 +2734,26 @@ public class Compiler {
         boolean isFieldStatic = !modifiersForNextElement.isEmpty() && (modifiersForNextElement.contains(TokenType.TOKEN_STATIC) || modifiersForNextElement.contains(TokenType.TOKEN_INLINE));
 
         int oldCurrentMethod = currentMethod;
-        if (type == CompilerType.CLASS || type == CompilerType.NESTED_CLASS) {
+        if (type == CompilerType.CLASS) {
             currentMethod = isFieldStatic ? 1 : 0;
 
             if (!isFieldStatic)
                 emitToInit(new VarInsnNode(Opcodes.ALOAD, 0));
         }
 
-        String name = parseIdentifier("Expect variable name.");
+        final List<String> names = new ArrayList<>();
+
+        String name;
+        if (match(TokenType.TOKEN_LEFT_PAREN)) {
+            do {
+                names.add(parseIdentifier("Expected identifier after \"(\"!"));
+            } while (match(TokenType.TOKEN_COMMA));
+
+            consume(TokenType.TOKEN_RIGHT_PAREN, "Expected \")\" after identifiers!");
+            name = null;
+        } else name = parseIdentifier("Expect variable name.");
+
+        boolean unpacking = !names.isEmpty();
 
         boolean inference = !match(TokenType.TOKEN_COLON);
 
@@ -2499,18 +2762,22 @@ public class Compiler {
         boolean nullable = false;
         String signature;
 
-        if (!inference) {
-            typeName = new Pair<>(parseType("Expected type name after \":\"."), parseGenericType());
-            type = Type.getType(typeName.k);
-            signature = type.getDescriptor().replace(";", "") + typeName.v + ";";
-            nullable = match(TokenType.TOKEN_QMARK);
-            type.nullable = nullable;
-            type.signature = signature;
-        } else {
-            if (!check(TokenType.TOKEN_EQUAL)) {
-                error("Expected \"=\", can not infer type");
+        if (!unpacking) {
+            if (!inference) {
+                typeName = new Pair<>(parseType("Expected type name after \":\"."), parseGenericType());
+                type = Type.getType(typeName.k);
+                signature = type.getDescriptor().replace(";", "") + typeName.v;
+                if (type.getSort() == Type.OBJECT)
+                    type.signature += ";";
+                nullable = match(TokenType.TOKEN_QMARK);
+                type.nullable = nullable;
+                type.signature = signature;
+            } else {
+                if (!check(TokenType.TOKEN_EQUAL)) {
+                    error("Expected \"=\", can not infer type");
 
-                return;
+                    return;
+                }
             }
         }
 
@@ -2518,24 +2785,30 @@ public class Compiler {
         if (setValue) {
             expression();
             if (!nullable && peekLastStack().nullable) {
-                error("Nullable value assigned to variable!");
+                error("Nullable value assigned to non-null variable!");
 
                 return;
             }
 
-            if (!inference) {
-                if (!peekLastStack().nullable) {
-                    convertLastStackForType(type);
-                }
-            } else type = peekLastStack();
+            if (!unpacking) {
+                if (!inference) {
+                    if (!peekLastStack().nullable) {
+                        convertLastStackForType(type);
+                    }
+                } else type = peekLastStack();
+            }
 
             if (instanceStack.isEmpty())
                 error("Variable expression doesn't output anything");
             if (instanceStack.size() != 1)
                 error("Variable expression has multiple outputs: " + instanceStack);
+        } else if (unpacking) {
+            error("Expected \"=\" after \")\"");
+
+            return;
         }
 
-        if (this.type == CompilerType.CLASS || this.type == CompilerType.NESTED_CLASS) {
+        if (this.type == CompilerType.CLASS) {
             if (modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
                 annotationsForNextElement.add(INLINE_ANNOTATION);
                 modifiersForNextElement.add(TokenType.TOKEN_STATIC);
@@ -2555,11 +2828,6 @@ public class Compiler {
                     emit(new FieldInsnNode(Opcodes.PUTSTATIC, getCurrentClass().name, name, type.getDescriptor()));
                 else
                     emit(new FieldInsnNode(Opcodes.PUTFIELD, getCurrentClass().name, name, type.getDescriptor()));
-
-                if (!modifiersForNextElement.contains(TokenType.TOKEN_INLINE)) {
-                    notifyPopStack();
-                    notifyPopStack();
-                }
             }
 
             modifiersForNextElement.clear();
@@ -2570,12 +2838,19 @@ public class Compiler {
                 return;
             }
 
-            Local local = new Local(type, maxLocals, start);
-            maxLocals += type.getSize();
-            if (setValue)
-                emit(new VarInsnNode(type.getOpcode(Opcodes.ISTORE), local.index));
+            if (unpacking) {
+                final Type lastStack = peekLastStack();
+                for (int i = 0; i < names.size(); i++)
+                    unpack(start, names.get(i), i, lastStack);
+                emit(new InsnNode(Opcodes.POP));
+            } else {
+                Local local = new Local(type, maxLocals, start);
+                maxLocals += type.getSize();
+                if (setValue)
+                    emit(new VarInsnNode(type.getOpcode(Opcodes.ISTORE), local.index));
 
-            locals.put(name, local);
+                locals.put(name, local);
+            }
         }
 
         if (setValue)
@@ -2683,11 +2958,68 @@ public class Compiler {
     }
 
     public void foreachStatement() {
-        varDeclaration(false);
+        final String identifier = parser.getPrevious().content();
+
+        LabelNode start = new LabelNode();
+        emit(start);
+
+        consume(TokenType.TOKEN_IN, "Expected \"in\" after variable declaration!");
+
+        expression();
+        if (!Iterable.class.isAssignableFrom(typeToClass(peekLastStack()))) {
+            error("Last stack isn't an iterator!");
+
+            return;
+        }
+
+        String sig = notifyPopStack().signature;
+        if (sig.contains("<"))
+            sig = sig.substring(sig.indexOf("<") + 1, sig.length() - 2);
+        else sig = "Ljava/lang/Object;";
+
+        final Type sigType = Type.getType(sig);
+
+        Local local = new Local(sigType, maxLocals, start);
+        maxLocals += sigType.getSize();
+
+        locals.put(identifier, local);
+
+        int iteratorIndex = maxLocals;
+        maxLocals++;
+        emit(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/lang/Iterable", "iterator", "()Ljava/util/Iterator;"));
+        emit(new VarInsnNode(Opcodes.ASTORE, iteratorIndex));
+
+        LabelNode l1 = new LabelNode();
+        LabelNode l2 = new LabelNode();
+        emit(l1);
+
+        emit(new VarInsnNode(Opcodes.ALOAD, iteratorIndex));
+        emit(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/util/Iterator", "hasNext", "()Z"));
+        emit(new JumpInsnNode(Opcodes.IFEQ, l2));
+
+        emit(new VarInsnNode(Opcodes.ALOAD, iteratorIndex));
+        emit(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/util/Iterator", "next", "()Ljava/lang/Object;"));
+        notifyPushStack(StackTypes.OBJECT_TYPE);
+        convertLastStackForType(sigType);
+        notifyPopStack();
+
+        emit(new VarInsnNode(sigType.getOpcode(Opcodes.ISTORE), local.index));
+
+        blockOrStatement();
+
+        emit(new JumpInsnNode(Opcodes.GOTO, l1));
+
+        emit(l2);
+    }
+
+    public void blockOrStatement() {
+        if (match(TokenType.TOKEN_LEFT_BRACE))
+            block();
+        else declaration();
     }
 
     public void forStatement() {
-        if (match(TokenType.TOKEN_LESS)) {
+        if (match(TokenType.TOKEN_IDENTIFIER)) {
             foreachStatement();
 
             return;
@@ -2756,17 +3088,40 @@ public class Compiler {
         emit(end);
     }
 
-    public void classDeclaration() {
-        consume(TokenType.TOKEN_IDENTIFIER, "Expect class name");
-        final String className = parser.getPrevious().content();
+    public static String getSimpleName(final String name) {
+        return name.substring(name.lastIndexOf("/") + 1);
+    }
 
-        type = CompilerType.CLASS;
+    public void classDeclaration(boolean nested) {
+        TokenType previousToken = parser.getPrevious().type();
+
+        boolean isEnum = previousToken.equals(TokenType.TOKEN_ENUM);
+        boolean isInterface = previousToken.equals(TokenType.TOKEN_TRAIT);
+
+        boolean annotation;
+        if (isInterface)
+            annotation = match(TokenType.TOKEN_AT);
+        else annotation = false;
+
+        consume(TokenType.TOKEN_IDENTIFIER, "Expect class name");
+        final String simpleName = parser.getPrevious().content();
+        final String innerClassName = (filePackage.replace(".", "/") + "/%s").formatted(simpleName);
+        final String className = nested ?
+                (filePackage.replace(".", "/") + "/%s")
+                        .formatted(getSimpleName(currentClass) + "$" + simpleName)
+                : innerClassName;
+
+        this.type = CompilerType.CLASS;
 
         ClassNode classNode = new ClassNode();
 
         boolean definedSuperclass = match(TokenType.TOKEN_COLON);
         if (definedSuperclass)
-            classNode.superName = parseType("Expect superclass name");
+            if (isEnum) {
+                error("Enums are not extendable!");
+
+                return;
+            } else classNode.superName = parseType("Expect superclass name");
 
         consume(TokenType.TOKEN_LEFT_BRACE, "Expected \"{\" before class body");
 
@@ -2774,11 +3129,40 @@ public class Compiler {
         classNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
         if (!Modifier.isPrivate(classNode.access))
             classNode.access |= Opcodes.ACC_PUBLIC;
-        classNode.name = (filePackage.replace(".", "/") + "/%s").formatted(className);
+        classNode.name = className;
         if (!definedSuperclass)
             classNode.superName = "java/lang/Object";
 
-        classNameReplacements.put(className, classNode.name);
+        if (isEnum) {
+            classNode.access |= Opcodes.ACC_FINAL;
+            classNode.access |= Opcodes.ACC_SUPER;
+            classNode.access |= Opcodes.ACC_ENUM;
+
+            classNode.signature = "Ljava/lang/Enum<L" + classNode.name + ";>;";
+
+            classNode.superName = "java/lang/Enum";
+        } else if (annotation) {
+            classNode.access |= Opcodes.ACC_ANNOTATION;
+            classNode.access |= Opcodes.ACC_INTERFACE;
+            classNode.access |= Opcodes.ACC_ABSTRACT;
+
+            classNode.interfaces.add("java/lang/annotation/Annotation");
+        } else if (isInterface) {
+            classNode.access |= Opcodes.ACC_ABSTRACT;
+            classNode.access |= Opcodes.ACC_INTERFACE;
+        }
+
+        String parentName = null;
+
+        if (nested) {
+            parentName = getCurrentClass().name;
+
+            getCurrentClass().visitInnerClass(className, parentName, simpleName, classNode.access);
+            classNode.visitOuterClass(currentClass, null, null);
+            getCurrentClass().nestMembers = Utils.addToNullableList(getCurrentClass().nestMembers, className);
+        }
+
+        classNameReplacements.put(innerClassName, classNode.name);
 
         if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC)) {
             error("Classes can not be magic!");
@@ -2794,13 +3178,20 @@ public class Compiler {
         classes.put(className, classNode);
 
         currentClass = className;
-        currentMethod = 1;
+        if (!annotation && !isInterface) {
+            currentMethod = 1;
 
-        addMethodToCurrentClass(new MethodNode(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null));
-        emitToInit(new VarInsnNode(Opcodes.ALOAD, 0),
-                new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
+            addMethodToCurrentClass(new MethodNode(isEnum ? Opcodes.ACC_PRIVATE : Opcodes.ACC_PUBLIC, "<init>", isEnum ? "(Ljava/lang/String;I)V" : "()V", isEnum ? "()V" : null, null));
+            if (isEnum)
+                emitToInit(new VarInsnNode(Opcodes.ALOAD, 0),
+                        new VarInsnNode(Opcodes.ALOAD, 1),
+                        new VarInsnNode(Opcodes.ILOAD, 2),
+                        new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/Enum", "<init>", "(Ljava/lang/String;I)V", false));
+            else emitToInit(new VarInsnNode(Opcodes.ALOAD, 0),
+                    new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
 
-        addMethodToCurrentClass(new MethodNode(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null));
+            addMethodToCurrentClass(new MethodNode(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null));
+        } else currentMethod = 0;
 
         while (!check(TokenType.TOKEN_RIGHT_BRACE) && !check(TokenType.TOKEN_EOF)) {
             modifier();
@@ -2810,87 +3201,26 @@ public class Compiler {
             } else if (match(TokenType.TOKEN_LET)) {
                 varDeclaration(false);
             } else if (match(TokenType.TOKEN_CLASS)) {
-                nestedClassDeclaration();
+                classDeclaration(true);
             } else if (match(TokenType.TOKEN_AT))
                 at(false);
+            else if (isEnum && check(TokenType.TOKEN_IDENTIFIER))
+                enumField();
         }
 
         consume(TokenType.TOKEN_RIGHT_BRACE, "Expected \"}\" after class body");
-    }
 
-    public void nestedClassDeclaration() {
-        final Compiler compiler = new Compiler(CompilerType.NESTED_CLASS, this);
-
-        compiler.consume(TokenType.TOKEN_IDENTIFIER, "Expect class name");
-        final String className = compiler.parser.getPrevious().content();
-
-        final String innerClassName = (filePackage.replace(".", "/") + "/%s").formatted(currentClass + "$" + className);
-
-        ClassNode classNode = new ClassNode();
-
-        if (compiler.match(TokenType.TOKEN_COLON))
-            classNode.superName = parseType("Expect superclass name");
-
-        compiler.consume(TokenType.TOKEN_LEFT_BRACE, "Expected \"{\" before class body");
-
-        classNode.version = Opcodes.V1_8;
-        classNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
-        if (!Modifier.isPrivate(classNode.access))
-            classNode.access |= Opcodes.ACC_PUBLIC;
-        classNode.name = (filePackage.replace(".", "/") + "/%s").formatted(className);
-        classNode.superName = "java/lang/Object";
-
-        if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC)) {
-            error("Classes can not be magic!");
-
-            return;
-        }
-
-        modifiersForNextElement.clear();
-
-        classNode.visibleAnnotations = new ArrayList<>(annotationsForNextElement);
-        annotationsForNextElement.clear();
-
-        if (compiler.match(TokenType.TOKEN_COLON))
-            classNode.superName = parseType("Expect superclass name");
-
-        getCurrentClass().visitInnerClass(innerClassName, getCurrentClass().name, className, classNode.access);
-        classNode.visitOuterClass(currentClass, null, null);
-
-        classes.put(currentClass + "$" + className, classNode);
-
-        compiler.currentClass = currentClass + "$" + className;
-        compiler.currentMethod = 1;
-
-        compiler.addMethodToCurrentClass(new MethodNode(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null));
-        compiler.emitToInit(new VarInsnNode(Opcodes.ALOAD, 0),
-                new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V"));
-
-        compiler.addMethodToCurrentClass(new MethodNode(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null));
-
-        getCurrentClass().visitNestMember(innerClassName);
-
-        while (!compiler.check(TokenType.TOKEN_RIGHT_BRACE) && !compiler.check(TokenType.TOKEN_EOF)) {
-            modifier();
-
-            if (match(TokenType.TOKEN_FN)) {
-                compiler.fnDeclaration();
-            } else if (match(TokenType.TOKEN_LET)) {
-                compiler.varDeclaration(false);
-            } else if (match(TokenType.TOKEN_CLASS)) {
-                compiler.nestedClassDeclaration();
-            } else if (match(TokenType.TOKEN_AT))
-                at(false);
-        }
-
-        compiler.consume(TokenType.TOKEN_RIGHT_BRACE, "Expected \"}\" after class body");
+        if (nested)
+            currentClass = parentName;
     }
 
     public void declaration() {
         modifier();
 
-        if (match(TokenType.TOKEN_CLASS)) {
-            classDeclaration();
+        if (match(TokenType.TOKEN_CLASS)
+                || match(TokenType.TOKEN_ENUM)
+                || match(TokenType.TOKEN_TRAIT)) {
+            classDeclaration(false);
         } else if (match(TokenType.TOKEN_FN)) {
             fnDeclaration();
         } else if (match(TokenType.TOKEN_LET)) {
@@ -2904,6 +3234,42 @@ public class Compiler {
         if (parser.isPanicMode()) synchronize();
 
         clearStack();
+    }
+
+    public void enumField() {
+        int index = 0;
+
+        final int access = Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_STATIC | Opcodes.ACC_ENUM;
+        final String className = "L" + getCurrentClass().name + ";";
+
+        do {
+            final String identifier = parseIdentifier("Expected identifier after \",\"");
+
+            getCurrentClass().fields.add(
+                    new FieldNode(access,
+                            identifier,
+                            className, null, null));
+
+            emit(new TypeInsnNode(Opcodes.NEW, getCurrentClass().name));
+            emit(new InsnNode(Opcodes.DUP));
+            emitConstant(identifier);
+            emitConstant(index);
+
+            emit(new MethodInsnNode(
+                    Opcodes.INVOKESPECIAL,
+                    getCurrentClass().name,
+                    "<init>",
+                    "(Ljava/lang/String;I)V"));
+            emit(new FieldInsnNode(
+                    Opcodes.PUTSTATIC,
+                    getCurrentClass().name,
+                    identifier,
+                    className));
+
+            index++;
+        } while (match(TokenType.TOKEN_COMMA));
+
+        emit(new InsnNode(Opcodes.RETURN));
     }
 
     public void whileStatement() {
@@ -2950,9 +3316,8 @@ public class Compiler {
 
         advance();
 
-        while (!match(TokenType.TOKEN_EOF)) {
+        while (!match(TokenType.TOKEN_EOF))
             declaration();
-        }
 
         for (MethodNode node : getCurrentClass().methods)
             if (Objects.equals(node.name, "<init>") ||

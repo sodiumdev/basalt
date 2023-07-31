@@ -1,14 +1,15 @@
 import basalt.lang.STDLib
 
 import java.lang.String
-import java.lang.Object
+
+import java.util.HashMap
+
+import zip.sodium.generated.Person
 
 class Main {
-    static fn String:doStuff() {
-        println("hi")
-    }
-
     static fn main(args: String[]) {
-        String.doStuff()
+        let person = Person:new()
+
+        let (name, age) = person
     }
 }
