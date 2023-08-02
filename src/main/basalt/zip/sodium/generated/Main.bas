@@ -6,10 +6,10 @@ import java.util.HashMap
 
 import zip.sodium.generated.Person
 
+import java.io.IOException
+
 class Main {
     static fn main(args: String[]) {
-        let person = Person:new()
-
-        let (name, age) = person
+        IOException:new()!
     }
 }

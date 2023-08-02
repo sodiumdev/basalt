@@ -31,6 +31,9 @@ public class Compiler {
     private static final AnnotationNode NULLABLE_ANNOTATION = new AnnotationNode("Lorg/jetbrains/annotations/Nullable;");
     private static final AnnotationNode NONNULL_ANNOTATION = new AnnotationNode("Lorg/jetbrains/annotations/NotNull;");
 
+    private boolean returned;
+    private boolean returnTypeDefined = true;
+
     private static AnnotationNode createExtensionAnnotation(ExtensionType type, Type extendingClass) {
         final AnnotationNode extensionAnnotation = new AnnotationNode("Lbasalt/lang/Extension;");
 
@@ -138,6 +141,7 @@ public class Compiler {
         rules.put(TokenType.TOKEN_ERROR, ParseRule.NULL);
         rules.put(TokenType.TOKEN_EOF, ParseRule.NULL);
         rules.put(TokenType.TOKEN_RETURN, ParseRule.NULL);
+        rules.put(TokenType.TOKEN_INTO, ParseRule.NULL);
         rules.put(TokenType.TOKEN_CLASS, ParseRule.NULL);
         rules.put(TokenType.TOKEN_WHILE, ParseRule.NULL);
         rules.put(TokenType.TOKEN_IF, ParseRule.NULL);
@@ -163,7 +167,7 @@ public class Compiler {
         rules.put(TokenType.TOKEN_SLASH, new ParseRule(null, Compiler::binary, Precedence.PREC_FACTOR));
         rules.put(TokenType.TOKEN_STAR, new ParseRule(null, Compiler::binary, Precedence.PREC_FACTOR));
 
-        rules.put(TokenType.TOKEN_BANG, new ParseRule(Compiler::unary, null, Precedence.PREC_NONE));
+        rules.put(TokenType.TOKEN_BANG, new ParseRule(Compiler::unary, Compiler::throw_, Precedence.PREC_CALL));
         rules.put(TokenType.TOKEN_BANG_EQUAL, new ParseRule(null, Compiler::binary, Precedence.PREC_EQUALITY));
         rules.put(TokenType.TOKEN_EQUAL_EQUAL, new ParseRule(null, Compiler::binary, Precedence.PREC_EQUALITY));
         rules.put(TokenType.TOKEN_GREATER, new ParseRule(Compiler::cast, Compiler::binary, Precedence.PREC_COMPARISON));
@@ -189,8 +193,7 @@ public class Compiler {
 
     private enum CompilerType {
         TOP,
-        CLASS, METHOD,
-        NESTED_METHOD,
+        CLASS, METHOD
     }
 
     public Compiler(String filePackage, String fileName, EphemeralRunner runner) {
@@ -448,15 +451,9 @@ public class Compiler {
         boolean canAssign = precedence.ordinal() <= Precedence.PREC_ASSIGNMENT.ordinal();
         prefixRule.accept(this, canAssign);
 
-        if (parser.hadError())
-            System.exit(-1);
-
         while (precedence.ordinal() <= getRule(parser.getCurrent().type()).precedence().ordinal()) {
             advance();
             getRule(parser.getPrevious().type()).infixRule().accept(this, canAssign);
-
-            if (parser.hadError())
-                System.exit(-1);
         }
 
         if (canAssign && match(TokenType.TOKEN_EQUAL))
@@ -677,6 +674,11 @@ public class Compiler {
             case TOKEN_TRUE -> emitBoolean(true);
             case TOKEN_NULL -> emitNull();
         }
+    }
+
+    public void throw_(boolean canAssign) {
+        emit(new InsnNode(Opcodes.ATHROW));
+        notifyPopStack();
     }
 
     public void unary(boolean canAssign) {
@@ -1320,7 +1322,7 @@ public class Compiler {
         final String identifier = parser.getPrevious().content();
 
         Local local;
-        if (type == CompilerType.METHOD || type == CompilerType.NESTED_METHOD)
+        if (type == CompilerType.METHOD)
             local = locals.get(identifier);
         else local = null;
 
@@ -1342,7 +1344,7 @@ public class Compiler {
                 return;
             }
 
-            if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
+            if (local == null || type != CompilerType.METHOD) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
                 return;
             }
@@ -1375,7 +1377,7 @@ public class Compiler {
                 return;
             }
 
-            if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
+            if (local == null || type != CompilerType.METHOD) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
                 return;
             }
@@ -1422,7 +1424,7 @@ public class Compiler {
                 return;
             }
 
-            if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
+            if (local == null || type != CompilerType.METHOD) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
                 return;
             }
@@ -1464,7 +1466,7 @@ public class Compiler {
                 return;
             }
 
-            if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
+            if (local == null || type != CompilerType.METHOD) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
                 return;
             }
@@ -1497,7 +1499,7 @@ public class Compiler {
                 return;
             }
 
-            if (local == null || (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD)) {
+            if (local == null || type != CompilerType.METHOD) {
                 errorAtCurrent("Variable \"" + identifier + "\" does not exist");
                 return;
             }
@@ -1542,48 +1544,52 @@ public class Compiler {
                 }
 
                 notifyPushTypeStack(repClass);
-            } else if (!check(TokenType.TOKEN_LEFT_PAREN)) {
-                final List<BasaltField> clone = new ArrayList<>(inlineFields);
-                Collections.reverse(clone);
 
-                Optional<BasaltField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
-                if (oInlineField.isPresent()) {
-                    final BasaltField inlineField = oInlineField.get();
-                    emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
-                    notifyPushStack(inlineField.type);
-                    return;
-                }
-
-                boolean isField = getCurrentClass().fields.stream()
-                        .anyMatch(x -> Objects.equals(x.name, identifier)) && !locals.containsKey(identifier);
-
-                boolean isFieldStatic = isField && getCurrentClass().fields.stream()
-                        .anyMatch(x -> (x.access & Opcodes.ACC_STATIC) == Opcodes.ACC_STATIC && Objects.equals(x.name, identifier));
-
-                if (local == null && type != CompilerType.CLASS && !isField) {
-                    errorAtCurrent("Variable \"" + identifier + "\" does not exist");
-                    return;
-                }
-
-                if (isField && (type == CompilerType.CLASS)) {
-                    final String desc = getCurrentClass().fields.stream()
-                            .filter(x -> Objects.equals(x.name, identifier))
-                            .findAny().orElseThrow().desc;
-
-                    if (isFieldStatic)
-                        emit(new FieldInsnNode(Opcodes.GETSTATIC, getCurrentClass().name, identifier, desc));
-                    else emit(new FieldInsnNode(Opcodes.GETFIELD, getCurrentClass().name, identifier, desc));
-                    notifyPushStack(Type.getType(desc));
-                } else {
-                    if (local == null) {
-                        error("Variable \"" + identifier + "\" does not exist");
-                        return;
-                    }
-
-                    emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
-                    notifyPushStack(local.type);
-                }
+                return;
             }
+
+            final List<BasaltField> clone = new ArrayList<>(inlineFields);
+            Collections.reverse(clone);
+
+            Optional<BasaltField> oInlineField = clone.stream().filter(x -> x.name.equals(identifier)).findFirst();
+            if (oInlineField.isPresent()) {
+                final BasaltField inlineField = oInlineField.get();
+                emit(new FieldInsnNode(Opcodes.GETSTATIC, inlineField.owner, inlineField.name, inlineField.type.getInternalName()));
+                notifyPushStack(inlineField.type);
+                return;
+            }
+
+            boolean isField = getCurrentClass().fields.stream()
+                    .anyMatch(x -> Objects.equals(x.name, identifier)) && !locals.containsKey(identifier);
+
+            boolean isFieldStatic = isField && getCurrentClass().fields.stream()
+                    .anyMatch(x -> (x.access & Opcodes.ACC_STATIC) == Opcodes.ACC_STATIC && Objects.equals(x.name, identifier));
+
+            if (local == null && type != CompilerType.CLASS && !isField) {
+                errorAtCurrent("Variable \"" + identifier + "\" does not exist");
+                return;
+            }
+
+            if (isField && type == CompilerType.CLASS) {
+                final String desc = getCurrentClass().fields.stream()
+                        .filter(x -> Objects.equals(x.name, identifier))
+                        .findAny().orElseThrow().desc;
+
+                if (isFieldStatic)
+                    emit(new FieldInsnNode(Opcodes.GETSTATIC, getCurrentClass().name, identifier, desc));
+                else emit(new FieldInsnNode(Opcodes.GETFIELD, getCurrentClass().name, identifier, desc));
+                notifyPushStack(Type.getType(desc));
+
+                return;
+            }
+
+            if (local == null) {
+                error("Variable \"" + identifier + "\" does not exist");
+                return;
+            }
+
+            emit(new VarInsnNode(local.type.getOpcode(Opcodes.ILOAD), local.index));
+            notifyPushStack(local.type);
         }
     }
 
@@ -1760,7 +1766,7 @@ public class Compiler {
 
                 modifiersForNextElement.addAll(modifiers);
             }
-            case TOKEN_CLASS -> {
+            case TOKEN_CLASS, TOKEN_ENUM, TOKEN_TRAIT -> {
                 if (modifiers.contains(TokenType.TOKEN_GETTER)) {
                     error("A class can not be a getter!");
 
@@ -1769,12 +1775,6 @@ public class Compiler {
 
                 if (modifiers.contains(TokenType.TOKEN_SETTER)) {
                     error("A class can not be a setter!");
-
-                    return;
-                }
-
-                if (modifiers.contains(TokenType.TOKEN_MAGIC)) {
-                    error("A class can not be magic!");
 
                     return;
                 }
@@ -1885,7 +1885,11 @@ public class Compiler {
         notifyPushStack(StackTypes.BOOLEAN);
     }
 
-    private void emitVoidReturn() {
+    public void emitReturn(Type type) {
+        emit(new InsnNode(type.getOpcode(Opcodes.IRETURN)));
+    }
+
+    public void emitVoidReturn() {
         emit(new InsnNode(Opcodes.RETURN));
     }
 
@@ -2427,8 +2431,6 @@ public class Compiler {
                 String generics = parseGenericType();
                 Type type = Type.getType(typeName);
                 type.nullable = match(TokenType.TOKEN_QMARK);
-
-                type = Type.getType(typeName);
                 type.signature = type.getDescriptor().replace(";", "") + generics;
                 if (type.getSort() == Type.OBJECT)
                     type.signature += ";";
@@ -2448,7 +2450,7 @@ public class Compiler {
 
         consume(TokenType.TOKEN_RIGHT_PAREN, "Expected \")\" after parameters!");
 
-        Type type = StackTypes.VOID;
+        Type type = null;
         if (isInterface && !check(TokenType.TOKEN_COLON)) {
             error("Expected return type!");
 
@@ -2459,7 +2461,7 @@ public class Compiler {
             type.nullable = match(TokenType.TOKEN_QMARK);
         }
 
-        if (modifiersForNextElement.contains(TokenType.TOKEN_SETTER) && !type.equals(StackTypes.VOID)) {
+        if (modifiersForNextElement.contains(TokenType.TOKEN_GETTER) && StackTypes.VOID.equals(type)) {
             error("Missing required return type in getter methods!");
 
             return;
@@ -2471,7 +2473,10 @@ public class Compiler {
         methodNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
         if (!Modifier.isPrivate(methodNode.access))
             methodNode.access |= Opcodes.ACC_PUBLIC;
-        methodNode.desc = Type.getMethodDescriptor(type, parameters.toArray(Type[]::new));
+        if (type != null) {
+            methodNode.desc = Type.getMethodDescriptor(type, parameters.toArray(Type[]::new));
+        } else compiler.returnTypeDefined = false;
+
         if (isInterface)
             methodNode.access |= Opcodes.ACC_ABSTRACT;
 
@@ -2498,10 +2503,8 @@ public class Compiler {
             compiler.currentMethod = 0;
         }
 
-        if (modifiersForNextElement.contains(TokenType.TOKEN_GETTER))
-            annotationsForNextElement.add(createPropertyAnnotation(PropertyType.GET, type));
-        else if (modifiersForNextElement.contains(TokenType.TOKEN_SETTER))
-            annotationsForNextElement.add(createPropertyAnnotation(PropertyType.SET, parameters.get(0)));
+        boolean getter = modifiersForNextElement.contains(TokenType.TOKEN_GETTER);
+        boolean setter = modifiersForNextElement.contains(TokenType.TOKEN_SETTER);
 
         modifiersForNextElement.clear();
 
@@ -2522,14 +2525,36 @@ public class Compiler {
                 compiler.declarationInMethod(name);
             }
 
+            if (type == null) {
+                if (!compiler.returned)
+                    type = StackTypes.VOID;
+                else type = compiler.notifyPopStack();
+
+                methodNode.desc = Type.getMethodDescriptor(type, parameters.toArray(Type[]::new));
+            }
+
             consume(TokenType.TOKEN_RIGHT_BRACE, "Expected \"}\" after method body");
-        } else if (!match(TokenType.TOKEN_SEMICOLON))
+        } else if (!match(TokenType.TOKEN_SEMICOLON)) {
             compiler.declarationInMethod(name);
+
+            if (type == null) {
+                if (!compiler.returned)
+                    type = StackTypes.VOID;
+                else type = compiler.notifyPopStack();
+
+                methodNode.desc = Type.getMethodDescriptor(type, parameters.toArray(Type[]::new));
+            }
+        }
+
+        if (getter)
+            methodNode.visibleAnnotations.add(createPropertyAnnotation(PropertyType.GET, type));
+        else if (setter)
+            methodNode.visibleAnnotations.add(createPropertyAnnotation(PropertyType.SET, parameters.get(0)));
 
         final LabelNode end = new LabelNode();
         compiler.emit(end);
 
-        if (type.equals(StackTypes.VOID) && !constructor && !isInterface)
+        if (StackTypes.VOID.equals(type) && !constructor && !isInterface)
             compiler.emitVoidReturn();
 
         for (Map.Entry<String, Local> entry : compiler.locals.entrySet()) {
@@ -2545,7 +2570,7 @@ public class Compiler {
 
         consume(TokenType.TOKEN_LEFT_PAREN, "Expect \"(\" after function name");
 
-        final Compiler compiler = new Compiler(CompilerType.NESTED_METHOD, this);
+        final Compiler compiler = new Compiler(CompilerType.METHOD, this);
         compiler.currentMethod = getCurrentClass().methods.size();
 
         final LabelNode start = new LabelNode();
@@ -2578,8 +2603,6 @@ public class Compiler {
                 String generics = parseGenericType();
                 Type type = Type.getType(typeName);
                 type.nullable = match(TokenType.TOKEN_QMARK);
-
-                type = Type.getType(typeName);
                 type.signature = type.getDescriptor().replace(";", "") + generics;
                 if (type.getSort() == Type.OBJECT)
                     type.signature += ";";
@@ -2593,7 +2616,7 @@ public class Compiler {
 
         consume(TokenType.TOKEN_RIGHT_PAREN, "Expect \")\" after parameters");
 
-        final Type type = Type.getType(consumeType("Expect return type after \":\""));
+        Type type = Type.getType(consumeType("Expect return type after \":\""));
         type.nullable = match(TokenType.TOKEN_QMARK);
 
         final MethodNode methodNode = compiler.getCurrentMethod(true);
@@ -2615,8 +2638,15 @@ public class Compiler {
             }
 
             consume(TokenType.TOKEN_RIGHT_BRACE, "Expected \"}\" after method body");
-        } else if (!match(TokenType.TOKEN_SEMICOLON))
-            compiler.declarationInMethod(name);
+        } else if (!match(TokenType.TOKEN_SEMICOLON)) {
+            if (match(TokenType.TOKEN_INTO)) {
+                expression();
+
+                type = peekLastStack();
+                emitReturn(type);
+            }
+            else compiler.declarationInMethod(name);
+        }
 
         final LabelNode end = new LabelNode();
         compiler.emit(end);
@@ -2728,7 +2758,7 @@ public class Compiler {
         clearStack();
 
         final LabelNode start = new LabelNode();
-        if (type == CompilerType.METHOD || type == CompilerType.NESTED_METHOD)
+        if (type == CompilerType.METHOD)
             emit(start);
 
         boolean isFieldStatic = !modifiersForNextElement.isEmpty() && (modifiersForNextElement.contains(TokenType.TOKEN_STATIC) || modifiersForNextElement.contains(TokenType.TOKEN_INLINE));
@@ -2831,7 +2861,7 @@ public class Compiler {
             }
 
             modifiersForNextElement.clear();
-        } else if (this.type == CompilerType.METHOD || this.type == CompilerType.NESTED_METHOD) {
+        } else if (this.type == CompilerType.METHOD) {
             if (!modifiersForNextElement.isEmpty()) {
                 errorAtCurrent("A variable can not have modifiers!");
 
@@ -2876,36 +2906,42 @@ public class Compiler {
     }
 
     public void returnStatement() {
-        if (type != CompilerType.METHOD && type != CompilerType.NESTED_METHOD) {
+        if (type != CompilerType.METHOD) {
             error("Can't return from code that are not in methods!");
             return;
         }
 
         if (match(TokenType.TOKEN_SEMICOLON)) {
             emitVoidReturn();
+
+            returned = true;
+
             return;
         }
 
         expression();
         boolean nullable = peekLastStack().nullable;
 
-        final Type returnType = Type.getReturnType(getCurrentMethod(true).desc);
-        if (nullable && !returnType.nullable) {
-            error("Tried to return nullable value while the return value can not be null!");
+        final Type returnType;
+        if (returnTypeDefined) {
+            returnType = Type.getReturnType(getCurrentMethod(true).desc);
+            if (nullable && !returnType.nullable) {
+                error("Tried to return nullable value while the return value can not be null!");
 
-            return;
-        }
+                return;
+            }
 
-        if (!returnType.equals(StackTypes.STRING_TYPE))
-            convertLastStackForType(returnType);
+            if (!returnType.equals(StackTypes.STRING_TYPE))
+                convertLastStackForType(returnType);
+        } else returnType = peekLastStack();
 
         emit(new InsnNode(returnType.getOpcode(Opcodes.IRETURN)));
 
-        consume(TokenType.TOKEN_SEMICOLON, "Expected \";\" after return statement");
+        returned = true;
     }
 
     public void statement(boolean clearStack) {
-        if (match(TokenType.TOKEN_RETURN))
+        if (match(TokenType.TOKEN_RETURN) || match(TokenType.TOKEN_INTO))
             returnStatement();
         else if (match(TokenType.TOKEN_LEFT_BRACE))
             block();
@@ -3098,6 +3134,14 @@ public class Compiler {
         boolean isEnum = previousToken.equals(TokenType.TOKEN_ENUM);
         boolean isInterface = previousToken.equals(TokenType.TOKEN_TRAIT);
 
+        boolean isClass = previousToken.equals(TokenType.TOKEN_CLASS);
+
+        boolean isMagic = !modifiersForNextElement.isEmpty() && modifiersForNextElement.contains(TokenType.TOKEN_MAGIC);
+        if (!isClass && isMagic) {
+            error("Only classes can be magic!");
+            return;
+        }
+
         boolean annotation;
         if (isInterface)
             annotation = match(TokenType.TOKEN_AT);
@@ -3123,7 +3167,8 @@ public class Compiler {
                 return;
             } else classNode.superName = parseType("Expect superclass name");
 
-        consume(TokenType.TOKEN_LEFT_BRACE, "Expected \"{\" before class body");
+        if (isMagic)
+            consume(TokenType.TOKEN_LEFT_PAREN, "Expected \"(\" after class name");
 
         classNode.version = Opcodes.V1_8;
         classNode.access = modifiersForNextElement.stream().map(x -> x.modifier).reduce((x, y) -> x | y).orElse(0);
@@ -3164,12 +3209,6 @@ public class Compiler {
 
         classNameReplacements.put(innerClassName, classNode.name);
 
-        if (modifiersForNextElement.contains(TokenType.TOKEN_MAGIC)) {
-            error("Classes can not be magic!");
-
-            return;
-        }
-
         modifiersForNextElement.clear();
 
         classNode.visibleAnnotations = new ArrayList<>(annotationsForNextElement);
@@ -3193,25 +3232,98 @@ public class Compiler {
             addMethodToCurrentClass(new MethodNode(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null));
         } else currentMethod = 0;
 
-        while (!check(TokenType.TOKEN_RIGHT_BRACE) && !check(TokenType.TOKEN_EOF)) {
-            modifier();
+        if (isMagic) {
+            MethodNode methodNode = new MethodNode();
+            LabelNode labelNode = new LabelNode();
+            emitTo(methodNode, labelNode);
 
-            if (match(TokenType.TOKEN_FN)) {
-                fnDeclaration();
-            } else if (match(TokenType.TOKEN_LET)) {
-                varDeclaration(false);
-            } else if (match(TokenType.TOKEN_CLASS)) {
-                classDeclaration(true);
-            } else if (match(TokenType.TOKEN_AT))
-                at(false);
-            else if (isEnum && check(TokenType.TOKEN_IDENTIFIER))
-                enumField();
+            emitTo(methodNode, new VarInsnNode(Opcodes.ALOAD, 0),
+                    new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
+
+            final List<Type> types = new ArrayList<>();
+            final Map<String, Local> locals = new HashMap<>();
+            int maxLocals = 1;
+
+            if (!check(TokenType.TOKEN_RIGHT_PAREN)) {
+                do {
+                    boolean isFinal = match(TokenType.TOKEN_FINAL);
+
+                    String arg = parseIdentifier("Expected parameter name");
+                    String typeName = consumeType("Expected type after parameter name");
+                    String generics = parseGenericType();
+                    Type type = Type.getType(typeName);
+                    type.nullable = match(TokenType.TOKEN_QMARK);
+                    type.signature = type.getDescriptor().replace(";", "") + generics;
+                    if (type.getSort() == Type.OBJECT)
+                        type.signature += ";";
+
+                    Local local = new Local(type, maxLocals, labelNode);
+                    locals.put(arg, local);
+                    maxLocals += type.getSize();
+
+                    int acc = Opcodes.ACC_PUBLIC;
+                    if (isFinal)
+                        acc |= Opcodes.ACC_FINAL;
+
+                    getCurrentClass().fields.add(new FieldNode(acc, arg, type.getDescriptor(), type.signature, null));
+
+                    emitTo(methodNode,
+                            new VarInsnNode(Opcodes.ALOAD, 0));
+                    emitTo(methodNode,
+                            new VarInsnNode(type.getOpcode(Opcodes.ILOAD), local.index));
+                    emitTo(methodNode,
+                            new FieldInsnNode(Opcodes.PUTFIELD, getCurrentClass().name, arg, type.getDescriptor()));
+
+                    types.add(type);
+                } while (match(TokenType.TOKEN_COMMA));
+            }
+
+            consume(TokenType.TOKEN_RIGHT_PAREN, "Expected \")\" after arguments");
+
+            methodNode.name = "<init>";
+            methodNode.desc = Type.getMethodDescriptor(Type.VOID_TYPE, types.toArray(Type[]::new));
+            methodNode.access = Opcodes.ACC_PUBLIC;
+
+            LabelNode end = new LabelNode();
+
+            emitTo(methodNode, end);
+            methodNode.localVariables = new ArrayList<>();
+
+            for (Map.Entry<String, Local> entry : locals.entrySet()) {
+                final Local local = entry.getValue();
+
+                methodNode.localVariables.add(new LocalVariableNode(entry.getKey(), local.type.getDescriptor(), local.type.signature, local.start, end, local.index));
+            }
+
+            addMethodToCurrentClass(methodNode);
         }
 
-        consume(TokenType.TOKEN_RIGHT_BRACE, "Expected \"}\" after class body");
+        if (match(TokenType.TOKEN_LEFT_BRACE)) {
+            while (!check(TokenType.TOKEN_RIGHT_BRACE) && !check(TokenType.TOKEN_EOF)) {
+                modifier();
+
+                if (match(TokenType.TOKEN_FN)) {
+                    fnDeclaration();
+                } else if (match(TokenType.TOKEN_LET)) {
+                    varDeclaration(false);
+                } else if (match(TokenType.TOKEN_CLASS)) {
+                    classDeclaration(true);
+                } else if (match(TokenType.TOKEN_AT))
+                    at(false);
+                else if (isEnum && check(TokenType.TOKEN_IDENTIFIER))
+                    enumField();
+            }
+
+            consume(TokenType.TOKEN_RIGHT_BRACE, "Expected \"}\" after class body");
+        }
 
         if (nested)
             currentClass = parentName;
+    }
+
+    public void emitTo(MethodNode methodNode, AbstractInsnNode... insnNode) {
+        for (AbstractInsnNode node : insnNode)
+            methodNode.instructions.add(node);
     }
 
     public void declaration() {
@@ -3297,7 +3409,7 @@ public class Compiler {
         while (parser.getCurrent().type() != TokenType.TOKEN_EOF) {
             if (parser.getPrevious().type() == TokenType.TOKEN_SEMICOLON) return;
             switch (parser.getCurrent().type()) {
-                case TOKEN_CLASS, TOKEN_FN, TOKEN_LET, TOKEN_FOR, TOKEN_IF, TOKEN_WHILE, TOKEN_RETURN -> {
+                case TOKEN_CLASS, TOKEN_TRAIT, TOKEN_ENUM, TOKEN_FN, TOKEN_LET, TOKEN_FOR, TOKEN_IF, TOKEN_WHILE, TOKEN_RETURN -> {
                     return;
                 }
 

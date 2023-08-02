@@ -1,0 +1,25 @@
+plugins {
+    id 'java-gradle-plugin'
+}
+
+group 'zip.sodium.basalt'
+version '0.1a'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation project(":compiler")
+}
+
+gradlePlugin {
+    plugins {
+        basaltJvmPlugin {
+            id = "zip.sodium.basalt"
+            description = "Basalt JVM plugin"
+            displayName = description
+            implementationClass = "zip.sodium.jbasalt.gradle.BasaltPlugin"
+        }
+    }
+}

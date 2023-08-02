@@ -82,7 +82,7 @@ public class Scanner {
             case ']' -> makeToken(TokenType.TOKEN_RIGHT_BRACK);
             case ',' -> makeToken(TokenType.TOKEN_COMMA);
             case '.' -> makeToken(TokenType.TOKEN_DOT);
-            case '-' -> makeToken(match('=') ? TokenType.TOKEN_MINUS_EQUAL : TokenType.TOKEN_MINUS);
+            case '-' -> makeToken(match('=') ? TokenType.TOKEN_MINUS_EQUAL : (match('>') ? TokenType.TOKEN_INTO : TokenType.TOKEN_MINUS));
             case '+' -> makeToken(match('=') ? TokenType.TOKEN_PLUS_EQUAL : TokenType.TOKEN_PLUS);
             case ';' -> makeToken(TokenType.TOKEN_SEMICOLON);
             case ':' -> makeToken(TokenType.TOKEN_COLON);
